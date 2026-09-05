@@ -2171,3 +2171,138 @@ any deviations from this implementation specification
 
 This makes the distinction between planned analysis and post hoc exploration
 auditable while still allowing the project to respond sensibly to Phase 1.
+
+---
+
+# 25. Frozen Phase 2 Decision Record
+
+**Decision date:** 2026-09-02
+
+**Evidence used:** the corrected Phase 1 artifacts summarized in `RESULTS.md`.
+No Phase 2 final-evaluation results had been inspected when this record was
+written.
+
+## 25.1 Phase 1 basis for the decision
+
+The Phase 1 acceptance validator reports `status: ready`, and all attack
+correctness diagnostics pass. Clean accuracy is matched across the dimensional
+sweep, so no accuracy-matching ablation is required before Phase 2.
+
+Changing \(d_z\) produces reproducible changes in representation geometry but
+only small, non-monotonic changes in input- and latent-PGD AUC. The learned
+512-dimensional model has a modest mean advantage over the compressed models;
+there is no evidence that deterministic dimensional compression improves
+robustness. Nuisance invariance is stable and non-monotonic. Median nearest
+opposing-class distance is the strongest corrected correlate of latent
+robustness.
+
+Effective rank changes only from approximately 8.2 to 9.2 while nominal width
+changes from 16 to 512. This indicates that nominal dimension is a weak proxy
+for realized representational capacity in the Phase 1 models. The seed-0
+identity diagnostic also differs materially from the learned full-width
+projection, especially under latent attack, so the learned \(d_z=512\) model
+is not a no-bottleneck baseline.
+
+These observations satisfy the Phase 2 gate through a reproducible semantic-
+margin/geometry change and a scientifically relevant weak robustness effect.
+
+## 25.2 Phase 2 scope and strengths
+
+Proceed with all four planned Phase 2 families using the definitions already
+fixed in Sections 2 and 17.6:
+
+- VIB at \(d_z=128\), with
+  \(\beta\in\{0,10^{-4},3\mathbin{\times}10^{-4},10^{-3},
+  3\mathbin{\times}10^{-3},10^{-2}\}\);
+- VQ with 16 tokens of dimension 32 and
+  \(K\in\{512,256,128,64,32,16\}\);
+- quantized continuous models at \(d_z=128\), with
+  \(b\in\{\mathrm{FP32},8,6,4,3,2\}\);
+- reconstruction-trained autoencoders with
+  \(d_z\in\{512,256,128,64,32\}\), evaluated with the fixed independent
+  classifier specified in Section 17.6.
+
+Use training seeds 0, 1, and 2 for every bottleneck configuration. Complete
+identity-control seeds 1 and 2 and aggregate the three identity seeds before
+using identity-versus-projection differences as evidence. This is the
+prespecified follow-up from Section 17.4, not a new Phase 2 model family.
+
+## 25.3 Family-specific training decisions
+
+No family-specific architecture or loss changes are introduced by this
+decision record. Use the VIB sampling and KL convention, gradient-updated VQ
+codebook and collapse criterion, exact scalar quantizer with straight-through
+training derivative, and pixel-MSE autoencoder objective already specified in
+Section 17.6. Use the common training protocol and checkpoint rules in Section
+17.7, except for the already specified autoencoder checkpoint selection by
+lowest tuning MSE.
+
+Run and pass the family-specific tests in Section 23 before training each
+family. Optimization remedies such as VIB KL warmup, an EMA VQ codebook,
+perceptual autoencoder loss, or family-specific hyperparameter changes are not
+part of the primary matrix. If a primary family fails its prespecified
+training-validity criteria, freeze and label any remedy as an optimization
+ablation rather than silently replacing the primary run.
+
+## 25.4 Outcomes and analysis emphasis
+
+The primary within-family Phase 2 outcomes are:
+
+1. input robust-accuracy AUC across bottleneck strength;
+2. the correctly defined family-specific latent robust-accuracy AUC across
+   bottleneck strength;
+3. median nearest opposing-class distance across bottleneck strength.
+
+Clean accuracy and, for autoencoders, reconstruction quality must accompany
+these outcomes. Effective rank, intra- and inter-class distance, separation
+ratio, contraction, encoder sensitivity, invariance, conditional attack
+success, and minimum-success-radius summaries remain explanatory or secondary
+outcomes as specified earlier.
+
+The Phase 1 evidence changes the emphasis of the cross-family synthesis, not
+the registered estimators. Phase 2 must:
+
+- distinguish configured strength from measured effective capacity;
+- test whether the local opposing-class-margin association replicates within
+  and across bottleneck mechanisms;
+- treat nuisance removal as an open hypothesis rather than an established
+  explanation;
+- prefer within-family trends and geometry-based cross-family comparisons over
+  equating nominal controls such as \(d_z\), \(K\), bits, and \(\beta\);
+- interpret a family-specific effect as mechanism-specific unless comparable
+  behavior is observed in other families.
+
+Input- and latent-AUC magnitudes must not be compared to each other. For VQ
+and scalar quantization, pre-quantization latent attacks remain primary and
+post-bottleneck ambient attacks remain explicitly labeled diagnostics. The
+identity result additionally requires latent robustness to be discussed as
+coordinate-dependent rather than as a representation-invariant quantity.
+
+## 25.5 Frozen attack budgets
+
+Retain the attack grids and final settings in Sections 18.1 and 18.2:
+
+- input \(L_\infty\) radii
+  \(\{0,1/255,2/255,4/255,8/255,12/255,16/255\}\);
+- relative-L2 latent radii
+  \(\{0,0.01,0.02,0.05,0.10,0.20,0.30\}\);
+- 40 steps and 5 restarts, with the specified initialization, projection,
+  candidate retention, EoT, BPDA/STE, and discrete-model Square Attack checks.
+
+No attack budget is changed in response to the Phase 1 outcomes. Every final
+evaluation must pass the correctness and convergence checks in Section 18.4.
+
+## 25.6 Deviations and claim boundary
+
+There are no deviations from the planned Phase 2 family matrix, strengths,
+training objectives, or attack budgets in this decision record. The added
+identity seeds implement an existing conditional requirement from Section
+17.4.
+
+The broader claim is now conditional. Phase 1 alone supports the statement
+that deterministic dimensional compression changes geometry while having at
+most a modest robustness effect in this setup. A general information-
+bottleneck claim requires comparable evidence from multiple Phase 2 families
+or a shared relationship between measured geometry and robustness. If Phase 2
+is also flat, that outcome will count as evidence against a general bottleneck-
+robustness relationship rather than as a reason to alter the experiment.

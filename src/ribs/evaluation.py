@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import yaml
 from torch.utils.data import DataLoader
 
 from .artifacts import load_latents, save_frame, save_latents
@@ -21,6 +23,8 @@ from .models import create_model
 from .square_attack import square_attack
 from .training import choose_device
 from .utils import environment_info, seed_everything, write_json
+
+ATTACK_PROTOCOL_VERSION = 2
 
 
 def _new_evaluation_dir(run_dir: Path, name: str, evaluation_config: dict[str, Any]) -> Path:
@@ -62,7 +66,7 @@ def load_model(run_dir: str | Path, checkpoint: str | None = None):
     model = create_model(config)
     model.load_state_dict(state["model"])
     device = choose_device(config)
-    return model.to(device), config, device
+    return model.to(device).eval(), config, device
 
 
 def make_loader(config: dict[str, Any], split: str, batch_size: int | None = None) -> DataLoader:
@@ -88,6 +92,21 @@ def make_loader(config: dict[str, Any], split: str, batch_size: int | None = Non
     )
 
 
+def _validate_reference_config(
+    config: dict[str, Any], reference_config: dict[str, Any], *, context: str
+) -> None:
+    if manifest_hash(config["data"]["manifest"]) != manifest_hash(
+        reference_config["data"]["manifest"]
+    ):
+        raise ValueError(f"{context} and reference classifier use different data manifests")
+    if str(reference_config.get("model", {}).get("family", "")).lower() != "identity":
+        raise ValueError(
+            f"{context} requires an independently trained identity reference classifier"
+        )
+    if int(reference_config.get("seed", -1)) != 0:
+        raise ValueError(f"{context} requires the prescribed seed-0 reference classifier")
+
+
 @torch.no_grad()
 def evaluate_clean_run(
     run_dir: str | Path,
@@ -111,7 +130,9 @@ def evaluate_clean_run(
         "stochastic_samples": 32 if config["model"].get("family") == "vib" else 1,
     }
     evaluation_dir = _new_evaluation_dir(run_dir, "clean", evaluation_config)
-    loader = make_loader(config, split)
+    loader = make_loader(
+        config, split, batch_size=int(config["attack"].get("evaluation_batch_size", 32))
+    )
     rows = []
     seen = 0
     sample_count = 32 if config["model"].get("family") == "vib" else 1
@@ -189,7 +210,9 @@ def extract_latents(
             raise ValueError("Refusing to overwrite latents extracted from a different checkpoint")
         return latent_path
     model, config, device = load_model(run_dir, checkpoint)
-    loader = make_loader(config, split)
+    loader = make_loader(
+        config, split, batch_size=int(config["attack"].get("evaluation_batch_size", 32))
+    )
     canonical, pre, labels, sample_ids = [], [], [], []
     code_indices = []
     logvars = []
@@ -255,8 +278,12 @@ def evaluate_attacks(
     run_dir = Path(run_dir)
     checkpoint = _resolve_checkpoint(run_dir, checkpoint)
     model, config, device = load_model(run_dir, checkpoint)
+    # The clean baseline is evaluated before input_pgd, so establish inference
+    # mode here rather than relying on the attack function to do it later.
+    model.eval()
     evaluation_config = {
         "kind": "robustness",
+        "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
         "checkpoint": checkpoint,
         "checkpoint_sha256": sha256_file(run_dir / "checkpoints" / checkpoint),
         "split": split,
@@ -267,9 +294,11 @@ def evaluate_attacks(
     loader = make_loader(
         config,
         split,
-        batch_size=min(int(config["train"].get("batch_size", 128)), max_samples or 10**9),
+        batch_size=min(
+            int(config["attack"].get("evaluation_batch_size", 32)), max_samples or 10**9
+        ),
     )
-    epsilons = [float(value) for value in config["attack"]["input_epsilons"]]
+    epsilons = sorted({float(value) for value in config["attack"]["input_epsilons"]})
     rhos = sorted({0.0, *(float(value) for value in config["attack"]["latent_rhos"])})
     attack_cfg = config["attack"]
     attack_seed = int(attack_cfg.get("seed", 2025))
@@ -291,6 +320,7 @@ def evaluate_attacks(
         with torch.no_grad():
             clean_logits = _predict_logits(model, images, sample_count, batch_seed)
             clean_predictions = clean_logits.argmax(dim=-1)
+        previous_input_candidate = images
         for epsilon in epsilons:
             radius_seed = batch_seed
             result = input_pgd(
@@ -302,7 +332,9 @@ def evaluate_attacks(
                 int(attack_cfg.get("restarts", 5)),
                 sample_count,
                 seed=radius_seed,
+                initial_adversarial=previous_input_candidate,
             )
+            previous_input_candidate = result.adversarial.detach()
             with torch.no_grad():
                 adv_pred = (
                     clean_predictions
@@ -330,6 +362,7 @@ def evaluate_attacks(
                         ),
                         "attack_seed": radius_seed,
                         "checkpoint": checkpoint,
+                        "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
                     }
                 )
         family = config["model"].get("family", "dimensional")
@@ -350,6 +383,8 @@ def evaluate_attacks(
             latent_clean_loss = torch.nn.functional.cross_entropy(
                 latent_clean_logits.float(), labels, reduction="none"
             )
+        previous_latent_candidate = clean_attack_latent
+        previous_ambient_candidate = getattr(clean_output, "latent", clean_attack_latent).detach()
         for rho in rhos:
             attack_function = prequantization_latent_pgd if discrete else latent_pgd
             radius_seed = batch_seed + 200_000 + round(rho * 1000) * 100
@@ -367,7 +402,9 @@ def evaluate_attacks(
                     int(attack_cfg.get("steps", 40)),
                     int(attack_cfg.get("restarts", 5)),
                     seed=radius_seed,
+                    initial_adversarial=previous_latent_candidate,
                 )
+                previous_latent_candidate = result.adversarial.detach()
                 adversarial_latent = result.adversarial
                 result_loss = result.loss
                 result_initial_loss = result.initial_loss
@@ -400,7 +437,13 @@ def evaluate_attacks(
                             latent_delta_norm[index] / latent_base_norm[index]
                         ),
                         "attack_seed": radius_seed,
+                        "best_restart": (
+                            int(result.restart[index])
+                            if rho > 0.0 and result.restart is not None
+                            else -1
+                        ),
                         "checkpoint": checkpoint,
+                        "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
                     }
                 )
             if discrete and rho > 0.0:
@@ -412,7 +455,9 @@ def evaluate_attacks(
                     int(attack_cfg.get("steps", 40)),
                     int(attack_cfg.get("restarts", 5)),
                     seed=radius_seed + 100_000,
+                    initial_adversarial=previous_ambient_candidate,
                 )
+                previous_ambient_candidate = diagnostic.adversarial.detach()
                 with torch.no_grad():
                     diagnostic_pred = model.classify_latent(diagnostic.adversarial).argmax(dim=-1)
                 for index, sample_id in enumerate(sample_ids):
@@ -428,8 +473,25 @@ def evaluate_attacks(
                             "loss": float(diagnostic.loss[index]),
                             "initial_loss": float(diagnostic.initial_loss[index]),
                             "attack_surface": "post_bottleneck_ambient",
+                            "l2_norm": float(
+                                (diagnostic.adversarial[index] - clean_output.latent[index])
+                                .flatten()
+                                .norm()
+                            ),
+                            "relative_l2_norm": float(
+                                (diagnostic.adversarial[index] - clean_output.latent[index])
+                                .flatten()
+                                .norm()
+                                / clean_output.latent[index].flatten().norm().clamp_min(1e-12)
+                            ),
+                            "best_restart": (
+                                int(diagnostic.restart[index])
+                                if diagnostic.restart is not None
+                                else -1
+                            ),
                             "attack_seed": radius_seed + 100_000,
                             "checkpoint": checkpoint,
+                            "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
                         }
                     )
         seen += take
@@ -457,7 +519,7 @@ def evaluate_attack_diagnostics(
     split: str = "final",
     checkpoint: str | None = None,
 ) -> Path:
-    """Run prespecified step/restart and EoT convergence checks on a shared subset."""
+    """Run convergence checks for every attack surface on a shared subset."""
     run_dir = Path(run_dir)
     checkpoint = _resolve_checkpoint(run_dir, checkpoint)
     model, config, device = load_model(run_dir, checkpoint)
@@ -474,8 +536,54 @@ def evaluate_attack_diagnostics(
     eot_samples = _sample_count(config)
     seed = int(attack_cfg.get("seed", 2025)) + 90_000_000
     tolerance = float(attack_cfg.get("diagnostic_tolerance", 0.02))
-    rows = []
+    rows: list[dict[str, Any]] = []
     failures = []
+
+    def compare(
+        surface: str,
+        radius: float,
+        baseline,
+        stronger,
+        *,
+        increased_eot=None,
+    ) -> None:
+        baseline_robust = float((~baseline.successful).float().mean())
+        stronger_robust = float((~stronger.successful).float().mean())
+        union_success = baseline.successful | stronger.successful
+        union_robust = float((~union_success).float().mean())
+        row = {
+            "attack_surface": surface,
+            "radius": radius,
+            "baseline_robust_accuracy": baseline_robust,
+            "stronger_robust_accuracy": stronger_robust,
+            "union_robust_accuracy": union_robust,
+            "stronger_shift": stronger_robust - baseline_robust,
+            "convergence_drop": baseline_robust - union_robust,
+        }
+        passed = (
+            stronger_robust <= baseline_robust + tolerance
+            and baseline_robust - union_robust <= tolerance
+        )
+        if increased_eot is not None:
+            increased_eot_robust = float((~increased_eot.successful).float().mean())
+            eot_union_robust = float(
+                (~(baseline.successful | increased_eot.successful)).float().mean()
+            )
+            row.update(
+                {
+                    "increased_eot_robust_accuracy": increased_eot_robust,
+                    "eot_convergence_drop": baseline_robust - eot_union_robust,
+                }
+            )
+            passed = passed and increased_eot_robust <= baseline_robust + tolerance
+            passed = passed and baseline_robust - eot_union_robust <= tolerance
+        row["passed"] = passed
+        rows.append(row)
+        if not passed:
+            failures.append(
+                f"attack convergence failed for surface={surface} radius={radius}: {row}"
+            )
+
     for epsilon in [float(value) for value in attack_cfg["input_epsilons"] if float(value) > 0]:
         baseline = input_pgd(model, images, labels, epsilon, steps, restarts, eot_samples, seed)
         stronger = input_pgd(
@@ -488,35 +596,19 @@ def evaluate_attack_diagnostics(
             eot_samples,
             seed,
         )
-        baseline_robust = float((~baseline.successful).float().mean())
-        stronger_robust = float((~stronger.successful).float().mean())
-        passed = stronger_robust <= baseline_robust + tolerance
-        row = {
-            "epsilon": epsilon,
-            "baseline_robust_accuracy": baseline_robust,
-            "stronger_robust_accuracy": stronger_robust,
-            "passed": passed,
-        }
+        increased_eot = None
         if config["model"].get("family") == "vib":
-            with torch.no_grad():
-                attacked_prediction = _predict_logits(
-                    model, baseline.adversarial, eot_samples, seed + 1
-                ).argmax(1)
-                attacked_prediction_increased = _predict_logits(
-                    model, baseline.adversarial, eot_samples * 2, seed + 1
-                ).argmax(1)
-            row["eot_attacked_prediction_disagreement"] = float(
-                (attacked_prediction != attacked_prediction_increased).float().mean()
+            increased_eot = input_pgd(
+                model,
+                images,
+                labels,
+                epsilon,
+                steps,
+                restarts,
+                eot_samples * 2,
+                seed,
             )
-            if row["eot_attacked_prediction_disagreement"] > tolerance:
-                failures.append(
-                    "attacked EoT prediction disagreement "
-                    f"{row['eot_attacked_prediction_disagreement']:.4f} exceeds tolerance "
-                    f"at epsilon={epsilon}"
-                )
-        rows.append(row)
-        if not passed:
-            failures.append(f"stronger PGD raised robust accuracy at epsilon={epsilon}")
+        compare("input", epsilon, baseline, stronger, increased_eot=increased_eot)
     zero = input_pgd(model, images, labels, 0.0, steps, restarts, eot_samples, seed)
     if not torch.equal(zero.adversarial, images.float()):
         failures.append("epsilon=0 did not return the clean input exactly")
@@ -529,11 +621,51 @@ def evaluate_attack_diagnostics(
             failures.append(f"EoT prediction disagreement {disagreement:.4f} exceeds tolerance")
     else:
         disagreement = 0.0
+
+    family = str(config["model"].get("family", "dimensional")).lower()
+    discrete = family in {"vq", "quantized", "quantized_continuous"}
+    latent_attack = prequantization_latent_pgd if discrete else latent_pgd
+    latent_surface = "pre_quantization" if discrete else "canonical_latent"
+    for rho in [float(value) for value in attack_cfg["latent_rhos"] if float(value) > 0]:
+        latent_seed = seed + 10_000_000 + round(rho * 1000)
+        baseline = latent_attack(model, images, labels, rho, steps, restarts, latent_seed)
+        stronger = latent_attack(model, images, labels, rho, steps * 2, restarts * 2, latent_seed)
+        compare(latent_surface, rho, baseline, stronger)
+        with torch.no_grad():
+            output = model(images, sample=False)
+            clean_latent = (
+                output.pre_bottleneck.flatten(1) if discrete else output.canonical_latent.flatten(1)
+            )
+        allowed = rho * clean_latent.norm(dim=1).clamp_min(1e-12)
+        observed = (baseline.adversarial.flatten(1) - clean_latent).norm(dim=1)
+        if torch.any(observed > allowed + 1e-5):
+            failures.append(f"L2 bound failed for surface={latent_surface} rho={rho}")
+        if discrete:
+            ambient_baseline = latent_pgd(
+                model, images, labels, rho, steps, restarts, latent_seed + 1_000_000
+            )
+            ambient_stronger = latent_pgd(
+                model,
+                images,
+                labels,
+                rho,
+                steps * 2,
+                restarts * 2,
+                latent_seed + 1_000_000,
+            )
+            compare("post_bottleneck_ambient", rho, ambient_baseline, ambient_stronger)
     report = {
         "status": "passed" if not failures else "failed",
         "checkpoint": checkpoint,
         "sample_ids": [sample["sample_id"] for sample in samples],
         "rows": rows,
+        "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
+        "baseline_steps": steps,
+        "baseline_restarts": restarts,
+        "baseline_eot_samples": eot_samples,
+        "stronger_steps": steps * 2,
+        "stronger_restarts": restarts * 2,
+        "increased_eot_samples": eot_samples * 2 if family == "vib" else None,
         "eot_prediction_disagreement": disagreement,
         "tolerance": tolerance,
         "failures": failures,
@@ -544,6 +676,110 @@ def evaluate_attack_diagnostics(
     (evaluation_dir / "COMPLETED").write_text("completed\n", encoding="utf-8")
     if failures:
         raise RuntimeError("Attack diagnostics failed: " + "; ".join(failures))
+    return path
+
+
+def evaluate_autoencoder_attack_diagnostics(
+    run_dir: str | Path,
+    reference_run_dir: str | Path,
+    split: str = "final",
+    checkpoint: str | None = None,
+) -> Path:
+    """Run the same PGD correctness checks on the autoencoder task wrapper."""
+    run_dir = Path(run_dir)
+    autoencoder, config, device = load_model(run_dir, checkpoint)
+    reference, reference_config, reference_device = load_model(reference_run_dir)
+    if device != reference_device:
+        raise ValueError("Autoencoder and reference classifier must use the same device")
+    _validate_reference_config(config, reference_config, context="Autoencoder attack diagnostics")
+    task = _ReconstructionTask(autoencoder, reference).to(device).eval()
+    loader = make_loader(config, split, batch_size=1)
+    count = int(config["attack"].get("diagnostic_samples", 32))
+    indices = _stratified_dataset_indices(loader.dataset, count)
+    samples = [loader.dataset[index] for index in indices]
+    images = torch.stack([sample["image"] for sample in samples]).to(device)
+    labels = torch.tensor([sample["label"] for sample in samples], device=device)
+    attack_cfg = config["attack"]
+    steps = int(attack_cfg.get("steps", 40))
+    restarts = int(attack_cfg.get("restarts", 5))
+    tolerance = float(attack_cfg.get("diagnostic_tolerance", 0.02))
+    seed = int(attack_cfg.get("seed", 2025)) + 91_000_000
+    failures = []
+    rows = []
+    for epsilon in [float(value) for value in attack_cfg["input_epsilons"] if float(value) > 0]:
+        baseline = input_pgd(task, images, labels, epsilon, steps, restarts, seed=seed)
+        stronger = input_pgd(task, images, labels, epsilon, steps * 2, restarts * 2, seed=seed)
+        baseline_robust = float((~baseline.successful).float().mean())
+        stronger_robust = float((~stronger.successful).float().mean())
+        union_robust = float((~(baseline.successful | stronger.successful)).float().mean())
+        passed = (
+            stronger_robust <= baseline_robust + tolerance
+            and baseline_robust - union_robust <= tolerance
+        )
+        rows.append(
+            {
+                "attack_surface": "input",
+                "radius": epsilon,
+                "baseline_robust_accuracy": baseline_robust,
+                "stronger_robust_accuracy": stronger_robust,
+                "union_robust_accuracy": union_robust,
+                "passed": passed,
+            }
+        )
+        if not passed:
+            failures.append(f"stronger PGD raised robust accuracy at epsilon={epsilon}")
+        if torch.any(baseline.loss + 1e-6 < baseline.initial_loss):
+            failures.append(f"retained loss decreased at epsilon={epsilon}")
+        if torch.any((baseline.adversarial - images).abs().flatten(1).amax(1) > epsilon + 1e-6):
+            failures.append(f"L-infinity bound failed at epsilon={epsilon}")
+    zero = input_pgd(task, images, labels, 0.0, steps, restarts, seed=seed)
+    if not torch.equal(zero.adversarial, images.float()):
+        failures.append("epsilon=0 did not return the clean input exactly")
+    for rho in [float(value) for value in attack_cfg["latent_rhos"] if float(value) > 0]:
+        latent_seed = seed + 10_000_000 + round(rho * 1000)
+        baseline = latent_pgd(task, images, labels, rho, steps, restarts, latent_seed)
+        stronger = latent_pgd(task, images, labels, rho, steps * 2, restarts * 2, latent_seed)
+        baseline_robust = float((~baseline.successful).float().mean())
+        stronger_robust = float((~stronger.successful).float().mean())
+        union_robust = float((~(baseline.successful | stronger.successful)).float().mean())
+        passed = (
+            stronger_robust <= baseline_robust + tolerance
+            and baseline_robust - union_robust <= tolerance
+        )
+        rows.append(
+            {
+                "attack_surface": "canonical_latent",
+                "radius": rho,
+                "baseline_robust_accuracy": baseline_robust,
+                "stronger_robust_accuracy": stronger_robust,
+                "union_robust_accuracy": union_robust,
+                "passed": passed,
+            }
+        )
+        if not passed:
+            failures.append(f"latent attack convergence failed at rho={rho}")
+        with torch.no_grad():
+            clean_latent = task(images).canonical_latent.flatten(1)
+        allowed = rho * clean_latent.norm(dim=1).clamp_min(1e-12)
+        observed = (baseline.adversarial.flatten(1) - clean_latent).norm(dim=1)
+        if torch.any(observed > allowed + 1e-5):
+            failures.append(f"latent L2 bound failed at rho={rho}")
+    report = {
+        "status": "passed" if not failures else "failed",
+        "checkpoint": checkpoint or _resolve_checkpoint(run_dir, None),
+        "reference_run_dir": str(reference_run_dir),
+        "sample_ids": [sample["sample_id"] for sample in samples],
+        "rows": rows,
+        "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
+        "tolerance": tolerance,
+        "failures": failures,
+    }
+    evaluation_dir = _new_evaluation_dir(run_dir, "autoencoder-attack-diagnostics", report)
+    path = evaluation_dir / "diagnostics.json"
+    write_json(path, report)
+    (evaluation_dir / "COMPLETED").write_text("completed\n", encoding="utf-8")
+    if failures:
+        raise RuntimeError("Autoencoder attack diagnostics failed: " + "; ".join(failures))
     return path
 
 
@@ -587,10 +823,7 @@ def evaluate_autoencoder(
     reference, reference_config, reference_device = load_model(reference_run_dir)
     if reference_device != device:
         raise ValueError("Autoencoder and reference classifier must use the same device")
-    if manifest_hash(config["data"]["manifest"]) != manifest_hash(
-        reference_config["data"]["manifest"]
-    ):
-        raise ValueError("Autoencoder and reference classifier use different data manifests")
+    _validate_reference_config(config, reference_config, context="Autoencoder evaluation")
     evaluation_config = {
         "kind": "autoencoder_clean",
         "split": split,
@@ -602,7 +835,9 @@ def evaluate_autoencoder(
         ),
     }
     evaluation_dir = _new_evaluation_dir(run_dir, "autoencoder-clean", evaluation_config)
-    loader = make_loader(config, split)
+    loader = make_loader(
+        config, split, batch_size=int(config["attack"].get("evaluation_batch_size", 32))
+    )
     rows = []
     for batch in loader:
         images = batch["image"].to(device)
@@ -610,11 +845,15 @@ def evaluate_autoencoder(
             reconstruction = autoencoder(images).metadata["reconstruction"]
             original_logits = reference(images).logits
             reconstruction_logits = reference(reconstruction).logits
-        for sample_id, label, original, reconstructed in zip(
+            per_sample_mse = (reconstruction - images).square().flatten(1).mean(dim=1)
+            per_sample_psnr = -10.0 * torch.log10(per_sample_mse.clamp_min(1e-12))
+        for sample_id, label, original, reconstructed, mse, psnr in zip(
             batch["sample_id"],
             batch["label"],
             original_logits.argmax(1).cpu(),
             reconstruction_logits.argmax(1).cpu(),
+            per_sample_mse.cpu(),
+            per_sample_psnr.cpu(),
         ):
             rows.append(
                 {
@@ -624,6 +863,8 @@ def evaluate_autoencoder(
                     "reconstruction_prediction": int(reconstructed),
                     "reference_original_correct": bool(int(original) == int(label)),
                     "reconstruction_correct": bool(int(reconstructed) == int(label)),
+                    "reconstruction_mse": float(mse),
+                    "reconstruction_psnr_db": float(psnr),
                 }
             )
     path = evaluation_dir / f"reconstruction_{split}.parquet"
@@ -635,6 +876,8 @@ def evaluate_autoencoder(
                 pd.DataFrame(rows).reference_original_correct.mean()
             ),
             "reconstruction_accuracy": float(pd.DataFrame(rows).reconstruction_correct.mean()),
+            "reconstruction_mse": float(pd.DataFrame(rows).reconstruction_mse.mean()),
+            "reconstruction_psnr_db": float(pd.DataFrame(rows).reconstruction_psnr_db.mean()),
             **evaluation_config,
             "environment": environment_info(),
         },
@@ -658,12 +901,10 @@ def evaluate_autoencoder_attacks(
     reference, reference_config, reference_device = load_model(reference_run_dir)
     if reference_device != device:
         raise ValueError("Autoencoder and reference classifier must use the same device")
-    if manifest_hash(config["data"]["manifest"]) != manifest_hash(
-        reference_config["data"]["manifest"]
-    ):
-        raise ValueError("Autoencoder and reference classifier use different data manifests")
+    _validate_reference_config(config, reference_config, context="Autoencoder attack")
     evaluation_config = {
         "kind": "autoencoder_robustness",
+        "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
         "split": split,
         "max_samples": max_samples,
         "checkpoint": autoencoder_checkpoint,
@@ -676,7 +917,13 @@ def evaluate_autoencoder_attacks(
     }
     evaluation_dir = _new_evaluation_dir(run_dir, "autoencoder-robustness", evaluation_config)
     task = _ReconstructionTask(autoencoder, reference).to(device).eval()
-    loader = make_loader(config, split)
+    loader = make_loader(
+        config,
+        split,
+        batch_size=min(
+            int(config["attack"].get("evaluation_batch_size", 32)), max_samples or 10**9
+        ),
+    )
     input_rows, latent_rows = [], []
     seen = 0
     attack_cfg = config["attack"]
@@ -696,7 +943,8 @@ def evaluate_autoencoder_attacks(
         with torch.no_grad():
             clean_logits = task(images).logits
             clean_predictions = clean_logits.argmax(-1)
-        for epsilon in [float(value) for value in attack_cfg["input_epsilons"]]:
+        previous_input_candidate = images
+        for epsilon in sorted({float(value) for value in attack_cfg["input_epsilons"]}):
             result = input_pgd(
                 task,
                 images,
@@ -705,7 +953,9 @@ def evaluate_autoencoder_attacks(
                 int(attack_cfg.get("steps", 40)),
                 int(attack_cfg.get("restarts", 5)),
                 seed=batch_seed + round(epsilon * 255) * 10_000,
+                initial_adversarial=previous_input_candidate,
             )
+            previous_input_candidate = result.adversarial.detach()
             with torch.no_grad():
                 adversarial_prediction = task(result.adversarial).logits.argmax(-1)
             input_rows.extend(
@@ -719,7 +969,13 @@ def evaluate_autoencoder_attacks(
                     "successful": bool(adversarial_prediction[index] != labels[index]),
                     "loss": float(result.loss[index]),
                     "initial_loss": float(result.initial_loss[index]),
+                    "linf_norm": float((result.adversarial[index] - images[index]).abs().max()),
+                    "best_restart": (
+                        int(result.restart[index]) if result.restart is not None else -1
+                    ),
+                    "attack_seed": batch_seed + round(epsilon * 255) * 10_000,
                     "checkpoint": autoencoder_checkpoint,
+                    "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
                 }
                 for index, sample_id in enumerate(sample_ids)
             )
@@ -730,6 +986,7 @@ def evaluate_autoencoder_attacks(
             latent_clean_loss = torch.nn.functional.cross_entropy(
                 latent_clean_logits.float(), labels, reduction="none"
             )
+        previous_latent_candidate = clean_latent
         for rho in sorted({0.0, *(float(value) for value in attack_cfg["latent_rhos"])}):
             if rho == 0.0:
                 adversarial_latent = clean_latent
@@ -745,7 +1002,9 @@ def evaluate_autoencoder_attacks(
                     int(attack_cfg.get("steps", 40)),
                     int(attack_cfg.get("restarts", 5)),
                     seed=batch_seed + 200_000 + round(rho * 1000) * 100,
+                    initial_adversarial=previous_latent_candidate,
                 )
+                previous_latent_candidate = result.adversarial.detach()
                 adversarial_latent = result.adversarial
                 result_loss = result.loss
                 result_initial_loss = result.initial_loss
@@ -763,7 +1022,21 @@ def evaluate_autoencoder_attacks(
                     "loss": float(result_loss[index]),
                     "initial_loss": float(result_initial_loss[index]),
                     "attack_surface": "canonical_latent",
+                    "l2_norm": float(
+                        (adversarial_latent[index] - clean_latent[index]).flatten().norm()
+                    ),
+                    "relative_l2_norm": float(
+                        (adversarial_latent[index] - clean_latent[index]).flatten().norm()
+                        / clean_latent[index].flatten().norm().clamp_min(1e-12)
+                    ),
+                    "best_restart": (
+                        int(result.restart[index])
+                        if rho > 0.0 and result.restart is not None
+                        else -1
+                    ),
+                    "attack_seed": batch_seed + 200_000 + round(rho * 1000) * 100,
                     "checkpoint": autoencoder_checkpoint,
+                    "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
                 }
                 for index, sample_id in enumerate(sample_ids)
             )
@@ -778,6 +1051,10 @@ def evaluate_autoencoder_attacks(
         evaluation_dir / "config.json", {**evaluation_config, "environment": environment_info()}
     )
     (evaluation_dir / "COMPLETED").write_text("completed\n", encoding="utf-8")
+    if max_samples is None and bool(attack_cfg.get("run_diagnostics", True)):
+        paths["diagnostics"] = evaluate_autoencoder_attack_diagnostics(
+            run_dir, reference_run_dir, split, autoencoder_checkpoint
+        )
     return paths
 
 
@@ -850,42 +1127,203 @@ def _candidate_collision_pairs(
     return pairs
 
 
+def select_collision_lambda(metrics: pd.DataFrame) -> dict[str, Any]:
+    """Select a tuning candidate without consulting the final split."""
+    required = {
+        "lambda_sem",
+        "collision_success_rate",
+        "reference_source_preservation_rate",
+        "median_distance",
+    }
+    missing = required - set(metrics.columns)
+    if missing:
+        raise ValueError(f"Collision tuning metrics are missing columns: {sorted(missing)}")
+    if metrics.empty:
+        raise ValueError("Collision tuning requires at least one lambda candidate")
+    ranked = metrics.sort_values(
+        [
+            "collision_success_rate",
+            "reference_source_preservation_rate",
+            "median_distance",
+            "lambda_sem",
+        ],
+        ascending=[False, False, True, True],
+        kind="stable",
+    )
+    selected = ranked.iloc[0]
+    return {
+        "selected_lambda_sem": float(selected.lambda_sem),
+        "selection_rule": (
+            "maximize collision success; then maximize source-label preservation; "
+            "then minimize median representation distance; then choose the smaller lambda"
+        ),
+        "selected_metrics": {
+            column: float(selected[column])
+            for column in (
+                "collision_success_rate",
+                "reference_source_preservation_rate",
+                "median_distance",
+            )
+        },
+    }
+
+
+def tune_collision_lambda(
+    run_dir: str | Path,
+    reference_run_dir: str | Path,
+    lambdas: list[float],
+    max_pairs: int = 200,
+) -> Path:
+    """Tune the semantic-loss weight on development_tune and freeze the result."""
+    run_dir = Path(run_dir)
+    reference_run_dir = Path(reference_run_dir)
+    candidates = sorted({float(value) for value in lambdas})
+    if not candidates or any(value < 0 for value in candidates):
+        raise ValueError(
+            "Collision lambda candidates must be a non-empty list of nonnegative values"
+        )
+    checkpoint = _resolve_checkpoint(run_dir, None)
+    reference_checkpoint = _resolve_checkpoint(reference_run_dir, None)
+    _, config, _ = load_model(run_dir, checkpoint)
+    _, reference_config, _ = load_model(reference_run_dir, reference_checkpoint)
+    _validate_reference_config(config, reference_config, context="Collision lambda tuning")
+    tuning_config = {
+        "kind": "collision_lambda_tuning",
+        "split": "development_tune",
+        "lambda_candidates": candidates,
+        "max_pairs": int(max_pairs),
+        "checkpoint": checkpoint,
+        "checkpoint_sha256": sha256_file(run_dir / "checkpoints" / checkpoint),
+        "reference_run": str(reference_run_dir),
+        "reference_checkpoint": reference_checkpoint,
+        "reference_checkpoint_sha256": sha256_file(
+            reference_run_dir / "checkpoints" / reference_checkpoint
+        ),
+        "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
+    }
+    tuning_dir = _new_evaluation_dir(run_dir, "collision-tuning", tuning_config)
+    write_json(tuning_dir / "config.json", {**tuning_config, "environment": environment_info()})
+    rows = []
+    for candidate in candidates:
+        result_path = evaluate_collision_attacks(
+            run_dir,
+            reference_run_dir,
+            split="development_tune",
+            max_pairs=max_pairs,
+            lambda_sem=candidate,
+        )
+        records = pd.read_parquet(result_path)
+        positive_radius = records[records.epsilon > 0]
+        scored = positive_radius if not positive_radius.empty else records
+        rows.append(
+            {
+                "lambda_sem": candidate,
+                "collision_success_rate": float(scored.collision_success.astype(bool).mean()),
+                "reference_source_preservation_rate": float(
+                    scored.reference_source_preserved.astype(bool).mean()
+                ),
+                "median_distance": float(scored.distance.median()),
+                "num_records": int(len(scored)),
+                "evaluation_dir": str(result_path.parent),
+            }
+        )
+    metrics = pd.DataFrame(rows)
+    sweep_path = tuning_dir / "lambda_sweep.parquet"
+    save_frame(metrics, sweep_path)
+    selection = {
+        **select_collision_lambda(metrics),
+        **tuning_config,
+        "lambda_sweep_sha256": sha256_file(sweep_path),
+    }
+    selection_path = tuning_dir / "selection.json"
+    write_json(selection_path, selection)
+    (tuning_dir / "COMPLETED").write_text("completed\n", encoding="utf-8")
+    return selection_path
+
+
 def evaluate_collision_attacks(
     run_dir: str | Path,
     reference_run_dir: str | Path,
     split: str = "final",
     max_pairs: int = 1000,
     lambda_sem: float | None = None,
+    tuning_artifact: str | Path | None = None,
 ) -> Path:
     run_dir = Path(run_dir)
-    model, config, device = load_model(run_dir)
-    lambda_override = lambda_sem is not None
-    if lambda_sem is None:
-        lambda_sem = float(config["attack"].get("collision_lambda_sem", 1.0))
-    if split == "final" and lambda_override:
-        raise ValueError("Final collision evaluation must use the frozen lambda_sem from config")
-    if split == "final" and not bool(config["attack"].get("collision_lambda_sem_tuned", False)):
+    reference_run_dir = Path(reference_run_dir)
+    checkpoint = _resolve_checkpoint(run_dir, None)
+    reference_checkpoint = _resolve_checkpoint(reference_run_dir, None)
+    model, config, device = load_model(run_dir, checkpoint)
+    reference, reference_config, reference_device = load_model(
+        reference_run_dir, reference_checkpoint
+    )
+    if reference_device != device:
         raise ValueError(
-            "Tune collision_lambda_sem on development_tune and set "
-            "attack.collision_lambda_sem_tuned=true before final evaluation"
+            "Collision attack requires model and reference classifier on the same device"
         )
+    _validate_reference_config(config, reference_config, context="Collision attack")
+    lambda_override = lambda_sem is not None
+    if split == "final" and lambda_override:
+        raise ValueError("Final collision evaluation must use a frozen tuning artifact")
+    tuning_path: Path | None = None
+    if split == "final":
+        if tuning_artifact is None:
+            raise ValueError(
+                "Final collision evaluation requires --tuning-artifact from tune-collision"
+            )
+        tuning_path = Path(tuning_artifact)
+        if tuning_path.is_dir():
+            tuning_path = tuning_path / "selection.json"
+        if not tuning_path.exists() or not (tuning_path.parent / "COMPLETED").exists():
+            raise ValueError(f"Collision tuning artifact is incomplete: {tuning_path}")
+        selection = json.loads(tuning_path.read_text(encoding="utf-8"))
+        sweep_path = tuning_path.parent / "lambda_sweep.parquet"
+        if not sweep_path.exists() or selection.get("lambda_sweep_sha256") != sha256_file(
+            sweep_path
+        ):
+            raise ValueError("Collision tuning sweep is missing or its hash does not match")
+        recomputed_selection = select_collision_lambda(pd.read_parquet(sweep_path))
+        if float(selection.get("selected_lambda_sem", -1)) != float(
+            recomputed_selection["selected_lambda_sem"]
+        ):
+            raise ValueError("Collision tuning selection does not match the registered rule")
+        expected = {
+            "kind": "collision_lambda_tuning",
+            "split": "development_tune",
+            "checkpoint_sha256": sha256_file(run_dir / "checkpoints" / checkpoint),
+            "reference_checkpoint_sha256": sha256_file(
+                reference_run_dir / "checkpoints" / reference_checkpoint
+            ),
+            "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
+        }
+        mismatches = {
+            key: (selection.get(key), value)
+            for key, value in expected.items()
+            if selection.get(key) != value
+        }
+        if mismatches:
+            raise ValueError(f"Collision tuning artifact does not match this run: {mismatches}")
+        lambda_sem = float(selection["selected_lambda_sem"])
+    elif lambda_sem is None:
+        raise ValueError("Non-final collision evaluation requires an explicit lambda_sem")
     evaluation_config = {
         "kind": "collision",
         "split": split,
         "max_pairs": max_pairs,
         "lambda_sem": lambda_sem,
         "attack": config["attack"],
+        "checkpoint": checkpoint,
+        "checkpoint_sha256": sha256_file(run_dir / "checkpoints" / checkpoint),
+        "reference_run": str(reference_run_dir),
+        "reference_checkpoint": reference_checkpoint,
+        "reference_checkpoint_sha256": sha256_file(
+            reference_run_dir / "checkpoints" / reference_checkpoint
+        ),
+        "tuning_artifact": str(tuning_path) if tuning_path is not None else None,
+        "tuning_artifact_sha256": (sha256_file(tuning_path) if tuning_path is not None else None),
+        "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
     }
     evaluation_dir = _new_evaluation_dir(run_dir, "collision", evaluation_config)
-    reference, reference_config, reference_device = load_model(reference_run_dir)
-    if reference_device != device:
-        raise ValueError(
-            "Collision attack requires model and reference classifier on the same device"
-        )
-    if manifest_hash(config["data"]["manifest"]) != manifest_hash(
-        reference_config["data"]["manifest"]
-    ):
-        raise ValueError("Collision model and reference classifier use different data manifests")
     if config["model"].get("family") == "autoencoder":
         model = _ReconstructionTask(model, reference).to(device).eval()
     model.eval()
@@ -905,8 +1343,7 @@ def evaluate_collision_attacks(
         raise ValueError("No eligible source-target pairs for collision attack")
     tune_latent_path = run_dir / "artifacts" / "latents_development_tune.safetensors"
     tune_index_path = run_dir / "artifacts" / "latents_development_tune_index.parquet"
-    if not tune_latent_path.exists():
-        extract_latents(run_dir, "development_tune")
+    extract_latents(run_dir, "development_tune", checkpoint)
     tune = load_latents(tune_latent_path)
     tune_index = pd.read_parquet(tune_index_path)
     threshold = calibrate_collision_threshold(
@@ -928,7 +1365,7 @@ def evaluate_collision_attacks(
     )
     save_frame(pair_frame, evaluation_dir / "collision_pair_manifest.parquet")
     rows = []
-    epsilons = [float(value) for value in config["attack"]["input_epsilons"] if float(value) > 0]
+    epsilons = sorted({0.0, *(float(value) for value in config["attack"]["input_epsilons"])})
     for epsilon in epsilons:
         collision_batch_size = int(config["attack"].get("collision_batch_size", 8))
         for start in range(0, len(pairs), collision_batch_size):
@@ -988,6 +1425,18 @@ def evaluate_collision_attacks(
                     ),
                     "collision_success": bool(result["successful"][local]),
                     "collision_criterion": result["criterion"],
+                    "linf_norm": float(
+                        (result["adversarial"][local] - source_images[local]).abs().max()
+                    ),
+                    "input_bound_satisfied": bool(
+                        (result["adversarial"][local] - source_images[local]).abs().max()
+                        <= epsilon + 1e-6
+                    ),
+                    "lambda_sem": lambda_sem,
+                    "attack_seed": int(config["attack"].get("seed", 2025))
+                    + round(epsilon * 255) * 100_000
+                    + start,
+                    "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
                 }
                 if result["criterion"] == "threshold":
                     row["continuous_collision"] = bool(distances[local] < threshold)
@@ -1034,6 +1483,9 @@ def evaluate_collision_attacks(
             "environment": environment_info(),
         },
     )
+    write_json(
+        evaluation_dir / "config.json", {**evaluation_config, "environment": environment_info()}
+    )
     (evaluation_dir / "COMPLETED").write_text("completed\n", encoding="utf-8")
     return path
 
@@ -1056,6 +1508,7 @@ def evaluate_square_attack(
         "max_samples": max_samples,
         "query_budget": config["attack"].get("square_queries", 5000),
         "attack_seed": config["attack"].get("seed", 2025),
+        "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
     }
     evaluation_dir = _new_evaluation_dir(run_dir, "square", evaluation_config)
     loader = make_loader(config, split, batch_size=1)
@@ -1112,6 +1565,8 @@ def evaluate_square_attack(
                         "queries": int(config["attack"].get("square_queries", 5000)),
                         "attack_seed": radius_seed,
                         "checkpoint": checkpoint,
+                        "linf_norm": float((result.adversarial[index] - images[index]).abs().max()),
+                        "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
                     }
                 )
     path = evaluation_dir / "square_attack.parquet"
@@ -1120,22 +1575,121 @@ def evaluate_square_attack(
         path.with_suffix(".json"),
         {**evaluation_config, "environment": environment_info()},
     )
+    write_json(
+        evaluation_dir / "config.json", {**evaluation_config, "environment": environment_info()}
+    )
     (evaluation_dir / "COMPLETED").write_text("completed\n", encoding="utf-8")
     return path
 
 
+def _final_geometry_effective_rank(run_dir: Path) -> float:
+    matches = []
+    for candidate in (run_dir / "analysis").glob("geometry-*-attempt*"):
+        config_path = candidate / "config.json"
+        metric_path = candidate / "geometry.json"
+        if (
+            not (candidate / "COMPLETED").exists()
+            or not config_path.exists()
+            or not metric_path.exists()
+        ):
+            continue
+        analysis_config = json.loads(config_path.read_text(encoding="utf-8"))
+        if analysis_config.get("split") == "final" and analysis_config.get("max_samples") is None:
+            matches.append(metric_path)
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected exactly one complete final geometry analysis for {run_dir}, found {matches}"
+        )
+    metrics = json.loads(matches[0].read_text(encoding="utf-8"))
+    if "effective_rank" not in metrics:
+        raise ValueError(f"Geometry analysis lacks effective_rank: {matches[0]}")
+    return float(metrics["effective_rank"])
+
+
+def validate_nearest_capacity_source(
+    target_run_dir: str | Path,
+    source_run_dir: str | Path | None,
+    target_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify that transfer uses the nearest measured-capacity continuous run."""
+    target_run_dir = Path(target_run_dir)
+    proposed_source = Path(source_run_dir).resolve() if source_run_dir is not None else None
+    target_family = str(target_config["model"].get("family", "")).lower()
+    if target_family not in {"vq", "quantized", "quantized_continuous"}:
+        raise ValueError("The registered transfer diagnostic applies only to discrete models")
+    target_rank = _final_geometry_effective_rank(target_run_dir)
+    target_seed = int(target_config.get("seed", -1))
+    target_manifest_path = target_run_dir / "data_manifest_hash.txt"
+    if not target_manifest_path.exists():
+        raise ValueError(f"Missing target data-manifest hash: {target_manifest_path}")
+    target_manifest = target_manifest_path.read_text(encoding="utf-8").strip()
+    candidates: list[tuple[Path, float]] = []
+    missing_geometry = []
+    output_root = target_run_dir.parent.parent
+    for family in ("dimensional", "vib"):
+        for candidate in (output_root / family).glob("*"):
+            config_path = candidate / "resolved_config.yaml"
+            hash_path = candidate / "data_manifest_hash.txt"
+            if not (candidate / "COMPLETED").exists() or not config_path.exists():
+                continue
+            candidate_config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            if int(candidate_config.get("seed", -2)) != target_seed:
+                continue
+            if (
+                not hash_path.exists()
+                or hash_path.read_text(encoding="utf-8").strip() != target_manifest
+            ):
+                continue
+            try:
+                rank = _final_geometry_effective_rank(candidate)
+            except ValueError:
+                missing_geometry.append(str(candidate))
+                continue
+            candidates.append((candidate, rank))
+    if missing_geometry:
+        raise ValueError(
+            "Cannot establish nearest capacity because continuous candidates lack one complete "
+            f"final geometry analysis: {missing_geometry}"
+        )
+    if not candidates:
+        raise ValueError("No seed- and manifest-matched continuous capacity candidates found")
+    minimum_gap = min(abs(rank - target_rank) for _, rank in candidates)
+    nearest = [
+        path.resolve()
+        for path, rank in candidates
+        if abs(abs(rank - target_rank) - minimum_gap) <= 1e-12
+    ]
+    nearest = sorted(nearest, key=str)
+    if proposed_source is not None and proposed_source not in nearest:
+        raise ValueError(
+            "Transfer source is not the nearest measured-capacity continuous model; "
+            f"eligible nearest runs are {[str(path) for path in nearest]}"
+        )
+    selected_source = proposed_source or nearest[0]
+    source_rank = next(rank for path, rank in candidates if path.resolve() == selected_source)
+    return {
+        "matched_source_run": str(selected_source),
+        "capacity_metric": "effective_rank",
+        "target_effective_rank": target_rank,
+        "source_effective_rank": source_rank,
+        "absolute_capacity_gap": abs(source_rank - target_rank),
+        "matched_seed": target_seed,
+    }
+
+
 def evaluate_transfer_attack(
     target_run_dir: str | Path,
-    source_run_dir: str | Path,
+    source_run_dir: str | Path | None = None,
     split: str = "final",
     max_samples: int = 1000,
 ) -> Path:
     """Attack a continuous source checkpoint and evaluate transfer to a target checkpoint."""
     target_run_dir = Path(target_run_dir)
-    source_run_dir = Path(source_run_dir)
     target_checkpoint = _resolve_checkpoint(target_run_dir, None)
-    source_checkpoint = _resolve_checkpoint(source_run_dir, None)
     target, target_config, target_device = load_model(target_run_dir, target_checkpoint)
+    capacity_match = validate_nearest_capacity_source(target_run_dir, source_run_dir, target_config)
+    source_run_dir = Path(capacity_match["matched_source_run"])
+    source_checkpoint = _resolve_checkpoint(source_run_dir, None)
     source, source_config, source_device = load_model(source_run_dir, source_checkpoint)
     if target_device != source_device:
         raise ValueError("Source and target models must use the same device")
@@ -1157,6 +1711,8 @@ def evaluate_transfer_attack(
         "source_checkpoint_sha256": sha256_file(source_run_dir / "checkpoints" / source_checkpoint),
         "target_checkpoint": target_checkpoint,
         "target_checkpoint_sha256": sha256_file(target_run_dir / "checkpoints" / target_checkpoint),
+        **capacity_match,
+        "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
     }
     evaluation_dir = _new_evaluation_dir(target_run_dir, "transfer", evaluation_config)
     rows = []
@@ -1169,7 +1725,10 @@ def evaluate_transfer_attack(
         labels = torch.tensor([sample["label"] for sample in samples], device=target_device)
         with torch.no_grad():
             target_clean = target(images, sample=False).logits.argmax(1)
-        for epsilon in [float(value) for value in target_config["attack"]["input_epsilons"]]:
+        previous_source_candidate = images
+        for epsilon in sorted(
+            {float(value) for value in target_config["attack"]["input_epsilons"]}
+        ):
             radius_seed = base_seed + start
             result = input_pgd(
                 source,
@@ -1180,7 +1739,9 @@ def evaluate_transfer_attack(
                 int(target_config["attack"].get("restarts", 5)),
                 _sample_count(source_config),
                 radius_seed,
+                previous_source_candidate,
             )
+            previous_source_candidate = result.adversarial.detach()
             with torch.no_grad():
                 target_adversarial = target(result.adversarial, sample=False).logits.argmax(1)
             for local, sample in enumerate(samples):
@@ -1194,6 +1755,11 @@ def evaluate_transfer_attack(
                         "adversarial_prediction": int(target_adversarial[local]),
                         "successful": bool(target_adversarial[local] != labels[local]),
                         "linf_norm": float((result.adversarial[local] - images[local]).abs().max()),
+                        "best_restart": (
+                            int(result.restart[local]) if result.restart is not None else -1
+                        ),
+                        "attack_seed": radius_seed,
+                        "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
                     }
                 )
     path = evaluation_dir / "transfer_attack.parquet"

@@ -2,4 +2,9 @@ included_model_families_and_strengths: []
 family_specific_training_changes: []
 primary_phase2_outcomes: []
 final_attack_budgets: {}
+seeds:
+  training: [0, 1, 2]
+  split: 2025
+  attack: 2025
+checkpoint_selection_procedure: {}
 implementation_deviations: []

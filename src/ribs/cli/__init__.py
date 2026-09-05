@@ -11,6 +11,7 @@ from typing import Any
 from ..analysis import (
     aggregate_completed_runs,
     analyze_geometry,
+    analyze_identity_followup,
     analyze_invariance,
     summarize_attack_file,
     validate_phase1_acceptance,
@@ -26,7 +27,9 @@ from ..evaluation import (
     evaluate_square_attack,
     evaluate_transfer_attack,
     extract_latents,
+    tune_collision_lambda,
 )
+from ..phase2 import valid_identity_run, validate_decision_record
 from ..training import train_model
 
 
@@ -60,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     reference = subparsers.add_parser("train-reference")
     reference.add_argument("--config", default="configs/phase1.yaml")
     reference.add_argument("--set", action="append", default=[])
+
+    identity_matrix = subparsers.add_parser("train-identity-matrix")
+    identity_matrix.add_argument("--config", default="configs/phase1.yaml")
+    identity_matrix.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
+    identity_matrix.add_argument("--set", action="append", default=[])
 
     matrix = subparsers.add_parser("train-matrix")
     matrix.add_argument("--config", default="configs/phase1.yaml")
@@ -106,6 +114,13 @@ def build_parser() -> argparse.ArgumentParser:
     collision.add_argument("--split", default="final")
     collision.add_argument("--max-pairs", type=int, default=1000)
     collision.add_argument("--lambda-sem", type=float)
+    collision.add_argument("--tuning-artifact")
+
+    collision_tune = subparsers.add_parser("tune-collision")
+    collision_tune.add_argument("--run-dir", required=True)
+    collision_tune.add_argument("--reference-run-dir", required=True)
+    collision_tune.add_argument("--lambdas", nargs="+", type=float, required=True)
+    collision_tune.add_argument("--max-pairs", type=int, default=200)
 
     square = subparsers.add_parser("square-attack")
     square.add_argument("--run-dir", required=True)
@@ -114,18 +129,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     transfer = subparsers.add_parser("transfer-attack")
     transfer.add_argument("--run-dir", required=True)
-    transfer.add_argument("--source-run-dir", required=True)
+    transfer.add_argument("--source-run-dir")
     transfer.add_argument("--split", default="final")
     transfer.add_argument("--max-samples", type=int, default=1000)
 
     render = subparsers.add_parser("render")
     render.add_argument("--summary", default="outputs/phase1_summary.parquet")
     render.add_argument("--output-dir", default="outputs/figures")
+    render.add_argument("--experiment", choices=["phase1", "phase2"], default="phase1")
 
     aggregate = subparsers.add_parser("aggregate")
     aggregate.add_argument("--output-root", default="outputs")
+    aggregate.add_argument("--experiment", choices=["phase1", "phase2"], default="phase1")
+    aggregate.add_argument("--include-families", nargs="+")
     validate = subparsers.add_parser("validate-phase1")
     validate.add_argument("--output-root", default="outputs")
+    validate2 = subparsers.add_parser("validate-phase2")
+    validate2.add_argument("--output-root", default="outputs")
+    identity_followup = subparsers.add_parser("analyze-identity-followup")
+    identity_followup.add_argument("--output-root", default="outputs")
+    identity_followup.add_argument("--report-path")
     return parser
 
 
@@ -146,6 +169,17 @@ def main(argv: list[str] | None = None) -> int:
         config = _config(args)
         config["model"] = {**config["model"], "family": "identity", "dz": 512}
         print(train_model(config))
+        return 0
+    if args.command == "train-identity-matrix":
+        base = _config(args)
+        paths = []
+        for seed in args.seeds:
+            config = copy.deepcopy(base)
+            config["seed"] = seed
+            config["model"] = {**config["model"], "family": "identity", "dz": 512}
+            existing = valid_identity_run(config.get("output_dir", "outputs"), seed, config)
+            paths.append(str(existing) if existing is not None else str(train_model(config)))
+        print("\n".join(paths))
         return 0
     if args.command == "train-matrix":
         base = _config(args)
@@ -168,27 +202,34 @@ def main(argv: list[str] | None = None) -> int:
 
         base = _config(args)
         decision_path = Path(args.decision_record)
-        decision = yaml.safe_load(decision_path.read_text(encoding="utf-8"))
-        required = {
-            "included_model_families_and_strengths",
-            "family_specific_training_changes",
-            "primary_phase2_outcomes",
-            "final_attack_budgets",
-            "implementation_deviations",
+        decision = validate_decision_record(decision_path)
+        from ..phase2 import normalize_strength, parameter_for_family, values_for_family
+
+        family = str(base["model"]["family"]).lower()
+        expected_parameter = parameter_for_family(family)
+        if args.parameter != expected_parameter:
+            raise ValueError(
+                f"Phase 2 family {family} must vary {expected_parameter}, not {args.parameter}"
+            )
+        registered_values = {
+            normalize_strength(family, value) for value in values_for_family(family)
         }
-        if not isinstance(decision, dict) or not required.issubset(decision):
-            missing = sorted(required - set(decision or {}))
-            raise ValueError(f"Incomplete Phase 2 decision record; missing: {missing}")
-        nonempty = required - {"implementation_deviations"}
-        empty = sorted(key for key in nonempty if not decision[key])
-        if empty:
-            raise ValueError(f"Phase 2 decision record has unfilled fields: {empty}")
+        requested_values = {
+            normalize_strength(family, yaml.safe_load(value)) for value in args.values
+        }
+        if not requested_values.issubset(registered_values):
+            raise ValueError(
+                f"Requested {family} strengths are outside the frozen decision record: "
+                f"{sorted(requested_values, key=str)}"
+            )
         base["phase2_decision_record"] = {
             "path": str(decision_path),
             "sha256": hashlib.sha256(decision_path.read_bytes()).hexdigest(),
             "contents": decision,
         }
         paths = []
+        from ..phase2 import completed_run_for_config
+
         for seed in args.seeds:
             for value in args.values:
                 config = copy.deepcopy(base)
@@ -197,18 +238,46 @@ def main(argv: list[str] | None = None) -> int:
                     **config["model"],
                     args.parameter: yaml.safe_load(value),
                 }
-                paths.append(str(train_model(config)))
+                existing = completed_run_for_config(config.get("output_dir", "outputs"), config)
+                paths.append(str(existing) if existing is not None else str(train_model(config)))
         print("\n".join(paths))
         return 0
-    if args.command in {"render", "aggregate", "validate-phase1"}:
+    if args.command == "analyze-identity-followup":
+        report = analyze_identity_followup(args.output_root, args.report_path)
+        print(report)
+        return 0 if report["status"] == "ready" else 2
+    if args.command in {"render", "aggregate", "validate-phase1", "validate-phase2"}:
         if args.command == "render":
-            from ..plotting import render_phase1
+            from ..plotting import render_phase1, render_phase2
 
-            print("\n".join(str(path) for path in render_phase1(args.summary, args.output_dir)))
+            renderer = render_phase2 if args.experiment == "phase2" else render_phase1
+            print("\n".join(str(path) for path in renderer(args.summary, args.output_dir)))
         elif args.command == "aggregate":
-            print(aggregate_completed_runs(args.output_root).to_string(index=False))
-        else:
+            from ..phase2 import PHASE2_FAMILIES
+
+            families = args.include_families
+            if families is None:
+                families = (
+                    list(PHASE2_FAMILIES)
+                    if args.experiment == "phase2"
+                    else ["dimensional", "identity"]
+                )
+            print(
+                aggregate_completed_runs(
+                    args.output_root,
+                    output_prefix=args.experiment,
+                    include_families=families,
+                ).to_string(index=False)
+            )
+        elif args.command == "validate-phase1":
             report = validate_phase1_acceptance(args.output_root)
+            print(report)
+            if report["status"] != "ready":
+                return 2
+        else:
+            from ..analysis import validate_phase2_acceptance
+
+            report = validate_phase2_acceptance(args.output_root)
             print(report)
             if report["status"] != "ready":
                 return 2
@@ -227,9 +296,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "collision-attack":
         print(
             evaluate_collision_attacks(
-                run_dir, args.reference_run_dir, args.split, args.max_pairs, args.lambda_sem
+                run_dir,
+                args.reference_run_dir,
+                args.split,
+                args.max_pairs,
+                args.lambda_sem,
+                args.tuning_artifact,
             )
         )
+        return 0
+    if args.command == "tune-collision":
+        print(tune_collision_lambda(run_dir, args.reference_run_dir, args.lambdas, args.max_pairs))
         return 0
     if args.command == "square-attack":
         print(evaluate_square_attack(run_dir, args.split, args.max_samples))

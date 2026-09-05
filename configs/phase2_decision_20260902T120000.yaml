@@ -1,0 +1,111 @@
+record_type: frozen_phase2_decision
+created_at: '2026-09-02T12:00:00-04:00'
+status: frozen_before_phase2_final_evaluation
+phase1_basis:
+  acceptance: ready
+  decision_gate: passed_by_reproducible_geometry_and_semantic_margin_change
+  interpretation: >-
+    Phase 1 matched clean accuracy across dimensions, found small and
+    non-monotonic robustness differences, and found the median nearest
+    opposing-class distance to be the strongest corrected latent-robustness
+    association. The learned dz=512 projection remains distinct from the
+    identity control and is not called no-bottleneck.
+included_model_families_and_strengths:
+  dimensional:
+    parameter: dz
+    values: [512, 256, 128, 64, 32, 16]
+    role: existing_phase1_baseline_for_cross_family_geometry
+  vib:
+    parameter: beta
+    dz: 128
+    values: [0.0, 0.0001, 0.0003, 0.001, 0.003, 0.01]
+  vq:
+    parameter: codebook_size
+    tokens: 16
+    token_dim: 32
+    values: [512, 256, 128, 64, 32, 16]
+  quantized:
+    parameter: bits
+    dz: 128
+    values: [FP32, 8, 6, 4, 3, 2]
+  autoencoder:
+    parameter: dz
+    values: [512, 256, 128, 64, 32]
+family_specific_training_changes:
+  vib: >-
+    Use posterior mean and log-variance projections, logvar clamp [-10, 10],
+    one reparameterized sample per training input, and CE + beta*KL without
+    KL/dz normalization.
+  vq: >-
+    Use 16 shared-codebook tokens of dimension 32, gradient-updated codebook,
+    the specified codebook and commitment losses, and collapse exclusion after
+    five consecutive epochs below 10 percent active codes.
+  quantized: >-
+    Use Linear(512,128), tanh, exact uniform quantization, and straight-through
+    training derivative; FP32 is the tanh-only control.
+  autoencoder: >-
+    Use the fixed five-block nearest-neighbor decoder and pixel MSE only;
+    select by lowest development-tuning MSE and evaluate with the shared
+    independently trained seed-0 reference classifier.
+  common: >-
+    Keep the Phase 1 AdamW schedule, effective batch size, preprocessing,
+    manifests, splits, and three training seeds fixed.
+primary_phase2_outcomes:
+  - clean_accuracy_within_every_robustness_table
+  - input_pgd_normalized_auc
+  - family_specific_latent_pgd_normalized_auc
+  - conditional_attack_success_rate
+  - censored_minimum_success_radius
+  - median_nearest_opposing_class_distance
+  - effective_rank_and_geometry_metrics
+  - nuisance_invariance_semantic_distance_and_prediction_consistency
+  - discrete_collision_and_square_attack_diagnostics_where_applicable
+final_attack_budgets:
+  input_pgd:
+    norm: linf
+    epsilons: [0.0, 0.00392156862745, 0.0078431372549, 0.0156862745098, 0.0313725490196, 0.0470588235294, 0.0627450980392]
+    steps: 40
+    restarts: 5
+    initialization: uniform_inside_ball
+    step_size: 2*epsilon/40
+    projection: linf_ball_intersect_raw_pixel_[0,1]
+    retention: misclassification_then_highest_cross_entropy_loss
+  latent_pgd:
+    relative_l2_rhos: [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3]
+    steps: 40
+    restarts: 5
+    initialization: uniform_inside_per_sample_ball
+    step_size: 2*relative_radius/40
+    vib_eot_samples: 32
+    discrete_primary_surface: pre_quantization_with_exact_forward_and_ste_bpda
+    discrete_ambient_surface: diagnostic_only
+  square_attack:
+    subset_size: 1000
+    queries: 5000
+    families: [vq, quantized]
+  collision_attack:
+    steps: 200
+    restarts: 5
+    epsilon_grid: same_as_input_pgd
+    lambda_sem: frozen_from_development_tune
+seeds:
+  training: [0, 1, 2]
+  split: 2025
+  attack: 2025
+checkpoint_selection_procedure:
+  classification: highest_development_tuning_clean_accuracy_tie_break_earliest_epoch
+  autoencoder: lowest_development_tuning_mse_tie_break_earliest_epoch
+  robustness_never_used_for_selection: true
+  final_split_never_used_for_tuning: true
+pre_phase2_prerequisites:
+  identity_control: train_and_analyze_seeds_0_1_2_before_final_phase2_evaluation
+implementation_deviations:
+  - >-
+    None at freeze time. The identity seed-1 and seed-2 follow-up is an
+    existing Section 17.4 prerequisite, not a Phase 2 methodology change.
+analysis_rules:
+  replication_unit: training_seed
+  cross_family_scale: ordinal_only_and_explicitly_labeled
+  correlations: spearman_with_seed_cluster_bootstrap_and_bh_correction
+  causal_language: prohibited_for_exploratory_correlations
+  auc_cross_attack_magnitude_comparison: prohibited

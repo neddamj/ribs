@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,12 +21,85 @@ from .collisions import (
     natural_collision_metrics,
     nearest_opposing,
 )
-from .data import manifest_hash
-from .evaluation import _ReconstructionTask, extract_latents, load_model, make_loader
+from .config import config_hash
+from .data import manifest_hash, sha256_file
+from .evaluation import (
+    ATTACK_PROTOCOL_VERSION,
+    _ReconstructionTask,
+    _resolve_checkpoint,
+    extract_latents,
+    load_model,
+    make_loader,
+)
 from .geometry import contraction_metrics, encoder_spectral_norm, geometry_metrics
 from .invariance import invariance_metrics
 from .metrics import shared_clean_correct, summarize_curve
-from .utils import write_json
+from .phase2 import (
+    PHASE2_SPECS,
+    decision_record_hash,
+    phase2_strength_columns,
+    validate_decision_record,
+)
+from .utils import environment_info, write_json
+
+ANALYSIS_PROTOCOL_VERSION = 2
+
+CONFIGURATION_COLUMNS = (
+    "family",
+    "dz",
+    "beta",
+    "codebook_size",
+    "bits",
+    "strength_parameter",
+    "strength_value",
+    "bottleneck_strength_ordinal",
+)
+
+
+def _configuration_columns(frame: pd.DataFrame, *extra: str) -> list[str]:
+    """Return every available field that uniquely identifies a configuration."""
+    return [column for column in (*CONFIGURATION_COLUMNS, *extra) if column in frame]
+
+
+def _new_analysis_dir(run_dir: Path, kind: str, analysis_config: dict[str, Any]) -> Path:
+    base_name = f"{kind}-{config_hash(analysis_config)}"
+    attempt = 0
+    while True:
+        candidate = run_dir / "analysis" / f"{base_name}-attempt{attempt}"
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            attempt += 1
+
+
+def _completed_analysis_file(
+    run_dir: Path,
+    kind: str,
+    split: str,
+    filename: str,
+    legacy_filename: str | None = None,
+    *,
+    allow_legacy: bool = False,
+) -> Path | None:
+    matches = []
+    for candidate in (run_dir / "analysis").glob(f"{kind}-*-attempt*"):
+        config_path = candidate / "config.json"
+        if not (candidate / "COMPLETED").exists() or not config_path.exists():
+            continue
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if config.get("split") == split and config.get("max_samples") is None:
+            path = candidate / filename
+            if path.exists():
+                matches.append(path)
+    if len(matches) > 1:
+        raise ValueError(f"Multiple complete {kind} analyses found for {run_dir}: {matches}")
+    if matches:
+        return matches[0]
+    if allow_legacy:
+        legacy = run_dir / "analysis" / (legacy_filename or filename)
+        return legacy if legacy.exists() else None
+    return None
 
 
 def _stratified_sample_indices(index: pd.DataFrame, count: int) -> list[int]:
@@ -57,6 +131,19 @@ def analyze_geometry(
     max_samples: int | None = None,
 ) -> dict[str, Any]:
     run_dir = Path(run_dir)
+    checkpoint = _resolve_checkpoint(run_dir, None)
+    analysis_config = {
+        "kind": "geometry",
+        "analysis_protocol_version": ANALYSIS_PROTOCOL_VERSION,
+        "checkpoint": checkpoint,
+        "checkpoint_sha256": sha256_file(run_dir / "checkpoints" / checkpoint),
+        "split": split,
+        "max_samples": max_samples,
+        "jacobian_samples": jacobian_samples,
+    }
+    extract_latents(run_dir, split, checkpoint)
+    analysis_dir = _new_analysis_dir(run_dir, "geometry", analysis_config)
+    write_json(analysis_dir / "config.json", {**analysis_config, "environment": environment_info()})
     latent_path = run_dir / "artifacts" / f"latents_{split}.safetensors"
     index_path = run_dir / "artifacts" / f"latents_{split}_index.parquet"
     tensors = load_latents(latent_path)
@@ -66,12 +153,12 @@ def analyze_geometry(
         index = index.iloc[:max_samples].reset_index(drop=True)
     labels = torch.as_tensor(index.label.to_numpy())
     metrics = geometry_metrics(tensors["canonical_latent"], labels)
-    model, config, device = load_model(run_dir)
-    loader = make_loader(config, split)
-    analysis_dir = run_dir / "analysis"
-    analysis_dir.mkdir(parents=True, exist_ok=True)
+    model, config, device = load_model(run_dir, checkpoint)
+    loader = make_loader(
+        config, split, batch_size=int(config["attack"].get("evaluation_batch_size", 32))
+    )
     image_size = int(config["data"].get("image_size", 224))
-    raw_path = analysis_dir / f".raw_images_{split}.dat"
+    raw_path = analysis_dir / ".raw_images.dat"
     raw_images = np.memmap(
         raw_path, dtype="float32", mode="w+", shape=(len(index), 3, image_size, image_size)
     )
@@ -103,13 +190,12 @@ def analyze_geometry(
         metrics["encoder_jacobian_p95"] = float(torch.quantile(jacobian, 0.95))
     del image_tensor, raw_images
     raw_path.unlink(missing_ok=True)
-    write_json(run_dir / "analysis" / f"geometry_{split}.json", metrics)
+    write_json(analysis_dir / "geometry.json", metrics)
     distances, indices = nearest_opposing(tensors["canonical_latent"], labels)
     collision = natural_collision_metrics(tensors["canonical_latent"], labels)
     tuning_path = run_dir / "artifacts" / "latents_development_tune.safetensors"
     tuning_index_path = run_dir / "artifacts" / "latents_development_tune_index.parquet"
-    if not tuning_path.exists() or not tuning_index_path.exists():
-        extract_latents(run_dir, "development_tune")
+    extract_latents(run_dir, "development_tune", checkpoint)
     if tuning_path.exists() and tuning_index_path.exists():
         tuning = load_latents(tuning_path)
         tuning_index = pd.read_parquet(tuning_index_path)
@@ -155,8 +241,9 @@ def analyze_geometry(
         collision["vq_mean_token_match_fraction"] = float(matches.double().mean())
         collision["vq_median_hamming_distance"] = float((~matches).sum(dim=1).median())
         collision["vq_median_codebook_euclidean_distance"] = float(raw_codebook_distance.median())
-    save_frame(collision_frame, run_dir / "analysis" / f"natural_collisions_{split}.parquet")
-    write_json(run_dir / "analysis" / f"natural_collision_summary_{split}.json", collision)
+    save_frame(collision_frame, analysis_dir / "natural_collisions.parquet")
+    write_json(analysis_dir / "natural_collision_summary.json", collision)
+    (analysis_dir / "COMPLETED").write_text("completed\n", encoding="utf-8")
     return {**metrics, **collision}
 
 
@@ -175,7 +262,17 @@ def analyze_invariance(
     max_samples: int | None = None,
     reference_run_dir: str | Path | None = None,
 ) -> dict[str, float]:
-    model, config, device = load_model(run_dir)
+    run_dir = Path(run_dir)
+    checkpoint = _resolve_checkpoint(run_dir, None)
+    model, config, device = load_model(run_dir, checkpoint)
+    analysis_config: dict[str, Any] = {
+        "kind": "invariance",
+        "analysis_protocol_version": ANALYSIS_PROTOCOL_VERSION,
+        "checkpoint": checkpoint,
+        "checkpoint_sha256": sha256_file(run_dir / "checkpoints" / checkpoint),
+        "split": split,
+        "max_samples": max_samples,
+    }
     if config["model"].get("family") == "autoencoder":
         if reference_run_dir is None:
             raise ValueError("Autoencoder invariance requires reference_run_dir")
@@ -186,8 +283,28 @@ def analyze_invariance(
             reference_config["data"]["manifest"]
         ):
             raise ValueError("Autoencoder and reference classifier use different data manifests")
+        if str(reference_config.get("model", {}).get("family", "")).lower() != "identity":
+            raise ValueError("Autoencoder invariance requires an identity reference classifier")
+        if int(reference_config.get("seed", -1)) != 0:
+            raise ValueError("Autoencoder invariance requires the seed-0 reference classifier")
+        reference_checkpoint = _resolve_checkpoint(Path(reference_run_dir), None)
+        analysis_config.update(
+            {
+                "reference_checkpoint": str(
+                    Path(reference_run_dir) / "checkpoints" / reference_checkpoint
+                ),
+                "reference_checkpoint_sha256": sha256_file(
+                    Path(reference_run_dir) / "checkpoints" / reference_checkpoint
+                ),
+            }
+        )
         model = _ReconstructionTask(model, reference).to(device).eval()
-    loader = make_loader(config, split)
+    extract_latents(run_dir, split, checkpoint)
+    analysis_dir = _new_analysis_dir(run_dir, "invariance", analysis_config)
+    write_json(analysis_dir / "config.json", {**analysis_config, "environment": environment_info()})
+    loader = make_loader(
+        config, split, batch_size=int(config["attack"].get("evaluation_batch_size", 32))
+    )
     batches: list[dict[str, float]] = []
     batch_sizes: list[int] = []
     seen = 0
@@ -209,10 +326,8 @@ def analyze_invariance(
         key: float(np.average([batch[key] for batch in batches], weights=batch_sizes))
         for key in keys
     }
-    latent_path = Path(run_dir) / "artifacts" / f"latents_{split}.safetensors"
-    index_path = Path(run_dir) / "artifacts" / f"latents_{split}_index.parquet"
-    if not latent_path.exists() or not index_path.exists():
-        extract_latents(run_dir, split)
+    latent_path = run_dir / "artifacts" / f"latents_{split}.safetensors"
+    index_path = run_dir / "artifacts" / f"latents_{split}_index.parquet"
     latent_tensors = load_latents(latent_path)
     latent_index = pd.read_parquet(index_path)
     if max_samples is not None:
@@ -225,20 +340,43 @@ def analyze_invariance(
     result["semantic_to_nuisance_ratio"] = float(
         semantic / (result["nuisance_distance_macro"] + 1e-12)
     )
-    write_json(Path(run_dir) / "analysis" / f"invariance_{split}.json", result)
+    write_json(analysis_dir / "invariance.json", result)
+    (analysis_dir / "COMPLETED").write_text("completed\n", encoding="utf-8")
     return result
 
 
-def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFrame:
+def aggregate_completed_runs(
+    output_root: str | Path = "outputs",
+    output_prefix: str = "phase1",
+    include_families: list[str] | tuple[str, ...] | None = None,
+) -> pd.DataFrame:
+    """Aggregate completed records into a namespaced result table.
+
+    Phase 1 keeps its historical filenames by default. Phase 2 passes a
+    separate prefix and family filter so new analysis never overwrites the
+    validated Phase 1 outputs.
+    """
     rows = []
     curve_rows = []
     sample_rows = []
     distance_rows = []
     collision_attack_rows = []
     clean_records: dict[str, pd.DataFrame] = {}
-    completed_runs = [
-        path for path in Path(output_root).glob("*/*") if (path / "COMPLETED").exists()
-    ]
+    allowed = set(include_families) if include_families is not None else None
+    completed_runs = []
+    for path in Path(output_root).glob("*/*"):
+        if not (path / "COMPLETED").exists():
+            continue
+        config_path = path / "resolved_config.yaml"
+        family = None
+        if config_path.exists():
+            family = (
+                (yaml.safe_load(config_path.read_text(encoding="utf-8")) or {})
+                .get("model", {})
+                .get("family")
+            )
+        if allowed is None or family in allowed:
+            completed_runs.append(path)
     training_configs: dict[str, list[Path]] = {}
     for run_dir in completed_runs:
         config_path = run_dir / "resolved_config.yaml"
@@ -279,6 +417,25 @@ def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFram
             "codebook_collapsed": bool(run_metrics.get("codebook_collapsed", False)),
             **config.get("model", {}),
         }
+        if base.get("family") == "autoencoder":
+            clean_summaries = [
+                candidate / "reconstruction_final.json"
+                for candidate in (run_dir / "evaluations").glob("autoencoder-clean-*-attempt*")
+                if (candidate / "COMPLETED").exists()
+                and (candidate / "reconstruction_final.json").exists()
+            ]
+            if len(clean_summaries) > 1:
+                raise ValueError(f"Multiple final autoencoder clean evaluations for {run_dir}")
+            if clean_summaries:
+                clean_summary = json.loads(clean_summaries[0].read_text(encoding="utf-8"))
+                for key in (
+                    "reference_original_accuracy",
+                    "reconstruction_accuracy",
+                    "reconstruction_mse",
+                    "reconstruction_psnr_db",
+                ):
+                    if key in clean_summary:
+                        base[key] = clean_summary[key]
         evaluation_dirs = []
         candidates = [
             *(run_dir / "evaluations").glob("robustness-*-attempt*"),
@@ -292,6 +449,7 @@ def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFram
             if (
                 evaluation_config.get("split") == "final"
                 and evaluation_config.get("max_samples") is None
+                and evaluation_config.get("attack_protocol_version") == ATTACK_PROTOCOL_VERSION
             ):
                 evaluation_dirs.append(candidate)
         if len(evaluation_dirs) > 1:
@@ -342,11 +500,31 @@ def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFram
                 for candidate in (run_dir / "evaluations").glob("square-*-attempt*")
                 if (candidate / "COMPLETED").exists()
                 and (candidate / "square_attack.parquet").exists()
+                and (candidate / "config.json").exists()
+                and json.loads((candidate / "config.json").read_text()).get("split") == "final"
+                and json.loads((candidate / "config.json").read_text()).get(
+                    "attack_protocol_version"
+                )
+                == ATTACK_PROTOCOL_VERSION
             ]
             if len(square_dirs) > 1:
                 raise ValueError(f"Multiple completed Square Attack evaluations for {run_dir}")
             if square_dirs:
-                square = pd.read_parquet(square_dirs[0] / "square_attack.parquet")
+                square = pd.read_parquet(square_dirs[0] / "square_attack.parquet").sort_values(
+                    ["sample_id", "radius"]
+                )
+                square["nested_success"] = square.groupby("sample_id")["successful"].cummax()
+                square["robust"] = (~square["nested_success"]).astype(float)
+                square_curve, square_summary = summarize_curve(square)
+                rows.append({**base, "attack": "input_square", **square_summary})
+                curve_rows.extend(
+                    {**base, "attack": "input_square", **record}
+                    for record in square_curve.to_dict("records")
+                )
+                sample_rows.extend(
+                    {**base, "attack": "input_square", **record}
+                    for record in square[["sample_id", "radius", "robust"]].to_dict("records")
+                )
                 pgd_subset = input_records.merge(
                     square[["sample_id", "radius"]].drop_duplicates(),
                     on=["sample_id", "radius"],
@@ -373,25 +551,85 @@ def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFram
                     {**base, "attack": "input_strongest", **record}
                     for record in combined_curve.to_dict("records")
                 )
-        geometry_path = run_dir / "analysis" / "geometry_final.json"
-        if geometry_path.exists():
+            transfer_dirs = [
+                candidate
+                for candidate in (run_dir / "evaluations").glob("transfer-*-attempt*")
+                if (candidate / "COMPLETED").exists()
+                and (candidate / "transfer_attack.parquet").exists()
+                and (candidate / "config.json").exists()
+                and json.loads((candidate / "config.json").read_text()).get("split") == "final"
+                and json.loads((candidate / "config.json").read_text()).get(
+                    "attack_protocol_version"
+                )
+                == ATTACK_PROTOCOL_VERSION
+            ]
+            if len(transfer_dirs) > 1:
+                raise ValueError(f"Multiple completed transfer evaluations for {run_dir}")
+            if transfer_dirs:
+                transfer = pd.read_parquet(
+                    transfer_dirs[0] / "transfer_attack.parquet"
+                ).sort_values(["sample_id", "radius"])
+                transfer["nested_success"] = transfer.groupby("sample_id")["successful"].cummax()
+                transfer["robust"] = (~transfer["nested_success"]).astype(float)
+                transfer_curve, transfer_summary = summarize_curve(transfer)
+                rows.append({**base, "attack": "input_transfer", **transfer_summary})
+                curve_rows.extend(
+                    {**base, "attack": "input_transfer", **record}
+                    for record in transfer_curve.to_dict("records")
+                )
+                sample_rows.extend(
+                    {**base, "attack": "input_transfer", **record}
+                    for record in transfer[["sample_id", "radius", "robust"]].to_dict("records")
+                )
+        geometry_path = _completed_analysis_file(
+            run_dir, "geometry", "final", "geometry.json", "geometry_final.json"
+        )
+        if geometry_path is not None:
             geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
             for row in rows:
                 if row["run_dir"] == str(run_dir):
                     row.update(geometry)
-        collision_path = run_dir / "analysis" / "natural_collisions_final.parquet"
-        if collision_path.exists():
+        invariance_path = _completed_analysis_file(
+            run_dir, "invariance", "final", "invariance.json", "invariance_final.json"
+        )
+        if invariance_path is not None:
+            invariance = json.loads(invariance_path.read_text(encoding="utf-8"))
+            for row in rows:
+                if row["run_dir"] == str(run_dir):
+                    row.update(invariance)
+        collision_path = _completed_analysis_file(
+            run_dir,
+            "geometry",
+            "final",
+            "natural_collisions.parquet",
+            "natural_collisions_final.parquet",
+        )
+        if collision_path is not None:
             natural_records = pd.read_parquet(collision_path)
             distance_rows.extend(
                 {**base, **record}
                 for record in natural_records[["sample_id", "distance"]].to_dict("records")
             )
-        collision_dirs = [
-            candidate
-            for candidate in (run_dir / "evaluations").glob("collision-*-attempt*")
-            if (candidate / "COMPLETED").exists()
-            and (candidate / "collision_attacks.parquet").exists()
-        ]
+        collision_dirs = []
+        for candidate in (run_dir / "evaluations").glob("collision-*-attempt*"):
+            if (
+                not (candidate / "COMPLETED").exists()
+                or not (candidate / "collision_attacks.parquet").exists()
+            ):
+                continue
+            metadata_path = candidate / "config.json"
+            if not metadata_path.exists():
+                metadata_path = candidate / "collision_attacks.json"
+            metadata = (
+                json.loads(metadata_path.read_text(encoding="utf-8"))
+                if metadata_path.exists()
+                else {}
+            )
+            if (
+                metadata.get("split", "final") == "final"
+                and metadata.get("attack_protocol_version") == ATTACK_PROTOCOL_VERSION
+            ):
+                collision_dirs.append(candidate)
         if len(collision_dirs) > 1:
             raise ValueError(f"Multiple completed collision evaluations found for {run_dir}")
         if collision_dirs:
@@ -400,13 +638,20 @@ def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFram
                 {**base, **record} for record in collision_attacks.to_dict("records")
             )
     frame = pd.DataFrame(rows)
-    save_frame(frame, Path(output_root) / "phase1_summary.parquet")
-    frame.to_csv(Path(output_root) / "phase1_summary.csv", index=False)
-    save_frame(pd.DataFrame(curve_rows), Path(output_root) / "phase1_curves.parquet")
+    output_path = Path(output_root)
+    if output_prefix == "phase2" and not frame.empty:
+        frame = phase2_strength_columns(frame)
+        curve_rows = phase2_strength_columns(pd.DataFrame(curve_rows)).to_dict("records")
+        sample_rows = phase2_strength_columns(pd.DataFrame(sample_rows)).to_dict("records")
+    save_frame(frame, output_path / f"{output_prefix}_summary.parquet")
+    frame.to_csv(output_path / f"{output_prefix}_summary.csv", index=False)
+    save_frame(pd.DataFrame(curve_rows), output_path / f"{output_prefix}_curves.parquet")
+    shared_clean_frame = pd.DataFrame()
     if clean_records:
+        shared_clean_frame = shared_clean_correct(clean_records)
         save_frame(
-            shared_clean_correct(clean_records),
-            Path(output_root) / "phase1_shared_clean_correct.parquet",
+            shared_clean_frame,
+            output_path / f"{output_prefix}_shared_clean_correct.parquet",
         )
     inferential_frame = frame[
         ~frame.get("codebook_collapsed", pd.Series(False, index=frame.index)).fillna(False)
@@ -416,21 +661,38 @@ def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFram
         [column for column in ("run_dir", "family", "seed") if column in frame],
     ]
     write_json(
-        Path(output_root) / "phase1_inferential_exclusions.json",
+        output_path / f"{output_prefix}_inferential_exclusions.json",
         {
             "reason": "codebook collapse (<10% active codes for five consecutive epochs)",
             "runs": excluded.to_dict("records"),
         },
     )
-    seed_level_summary(inferential_frame, output_root)
+    seed_level_summary(inferential_frame, output_root, output_prefix=output_prefix)
     primary_geometry = (
         inferential_frame[inferential_frame.family == "dimensional"]
         if "family" in inferential_frame
         else inferential_frame
     )
-    correlations = geometry_correlations(primary_geometry)
-    save_frame(correlations, Path(output_root) / "phase1_geometry_correlations.parquet")
-    correlations.to_csv(Path(output_root) / "phase1_geometry_correlations.csv", index=False)
+    if output_prefix == "phase2" and "family" in inferential_frame:
+        correlation_parts = []
+        for family, family_frame in inferential_frame.groupby("family", dropna=False):
+            part = geometry_correlations(family_frame)
+            if not part.empty:
+                part.insert(0, "family", family)
+                part.insert(0, "scope", "within_family")
+                correlation_parts.append(part)
+        cross_family = geometry_correlations(inferential_frame)
+        if not cross_family.empty:
+            cross_family.insert(0, "family", "all")
+            cross_family.insert(0, "scope", "cross_family_exploratory")
+            correlation_parts.append(cross_family)
+        correlations = (
+            pd.concat(correlation_parts, ignore_index=True) if correlation_parts else pd.DataFrame()
+        )
+    else:
+        correlations = geometry_correlations(primary_geometry)
+    save_frame(correlations, output_path / f"{output_prefix}_geometry_correlations.parquet")
+    correlations.to_csv(output_path / f"{output_prefix}_geometry_correlations.csv", index=False)
     dimensional = inferential_frame[
         inferential_frame.get("family", pd.Series(index=inferential_frame.index)) == "dimensional"
     ].copy()
@@ -440,15 +702,15 @@ def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFram
         )
         contrasts = dimensional.merge(baseline, on=["seed", "attack"], how="inner")
         contrasts["paired_robust_auc_delta"] = contrasts.robust_auc - contrasts.robust_auc_dz512
-        save_frame(contrasts, Path(output_root) / "phase1_paired_contrasts.parquet")
-        contrasts.to_csv(Path(output_root) / "phase1_paired_contrasts.csv", index=False)
+        save_frame(contrasts, output_path / f"{output_prefix}_paired_contrasts.parquet")
+        contrasts.to_csv(output_path / f"{output_prefix}_paired_contrasts.csv", index=False)
         mean_accuracy = dimensional.groupby(["attack", "dz"]).clean_accuracy.mean().reset_index()
         reference_accuracy = mean_accuracy[mean_accuracy.dz == 512][
             ["attack", "clean_accuracy"]
         ].rename(columns={"clean_accuracy": "reference_clean_accuracy"})
         matched = mean_accuracy.merge(reference_accuracy, on="attack")
         matched = matched[(matched.clean_accuracy - matched.reference_clean_accuracy).abs() <= 0.02]
-        save_frame(matched, Path(output_root) / "phase1_accuracy_matched_configs.parquet")
+        save_frame(matched, output_path / f"{output_prefix}_accuracy_matched_configs.parquet")
         dimensions = sorted(dimensional.dz.dropna().unique(), reverse=True)
         strength = {dimension: index for index, dimension in enumerate(dimensions)}
         dimensional["bottleneck_strength"] = dimensional.dz.map(strength)
@@ -460,7 +722,7 @@ def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFram
         trends["median_nearest_opposing_distance"] = ordinal_trends(
             distance_by_run, "bottleneck_strength", "median_nearest_opposing_distance"
         )
-        write_json(Path(output_root) / "phase1_ordinal_trends.json", trends)
+        write_json(output_path / f"{output_prefix}_ordinal_trends.json", trends)
         matched_dimensions = matched[["attack", "dz"]].drop_duplicates()
         matched_rows = dimensional.merge(matched_dimensions, on=["attack", "dz"], how="inner")
         matched_trends = {
@@ -468,7 +730,7 @@ def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFram
             for attack, group in matched_rows.groupby("attack")
         }
         write_json(
-            Path(output_root) / "phase1_accuracy_matched_trends.json",
+            output_path / f"{output_prefix}_accuracy_matched_trends.json",
             matched_trends,
         )
     identity = inferential_frame[
@@ -487,15 +749,31 @@ def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFram
             )
         save_frame(
             identity_comparison,
-            Path(output_root) / "phase1_identity_diagnostic.parquet",
+            output_path / f"{output_prefix}_identity_diagnostic.parquet",
         )
     sample_frame = pd.DataFrame(sample_rows)
+    if not sample_frame.empty and not shared_clean_frame.empty:
+        shared_ids = set(shared_clean_frame.sample_id.astype(str))
+        shared_samples = sample_frame[sample_frame.sample_id.astype(str).isin(shared_ids)].copy()
+        shared_group_columns = _configuration_columns(shared_samples, "run_dir", "seed", "attack")
+        shared_summaries = []
+        for keys, group in shared_samples.groupby(shared_group_columns, dropna=False):
+            key_values = keys if isinstance(keys, tuple) else (keys,)
+            records = group[["sample_id", "radius", "robust"]].copy()
+            records["successful"] = records.robust.eq(0.0)
+            records["clean_correct"] = True
+            _, summary = summarize_curve(records)
+            shared_summaries.append(
+                {**dict(zip(shared_group_columns, key_values)), **summary, "scope": "shared_clean"}
+            )
+        save_frame(
+            pd.DataFrame(shared_summaries),
+            output_path / f"{output_prefix}_shared_clean_summary.parquet",
+        )
     bootstrap_rows = []
     if not sample_frame.empty:
         sample_frame = sample_frame[~sample_frame["codebook_collapsed"].fillna(False).astype(bool)]
-        group_columns = [
-            column for column in ("family", "dz", "attack", "radius") if column in sample_frame
-        ]
+        group_columns = _configuration_columns(sample_frame, "attack", "radius")
         for keys, group in sample_frame.groupby(group_columns, dropna=False):
             estimate, lower, upper = hierarchical_bootstrap(group, "robust")
             key_values = keys if isinstance(keys, tuple) else (keys,)
@@ -514,7 +792,9 @@ def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFram
         distance_frame = distance_frame[
             ~distance_frame["codebook_collapsed"].fillna(False).astype(bool)
         ]
-        group_columns = [column for column in ("family", "dz") if column in distance_frame]
+        if output_prefix == "phase2":
+            distance_frame = phase2_strength_columns(distance_frame)
+        group_columns = _configuration_columns(distance_frame)
         for keys, group in distance_frame.groupby(group_columns, dropna=False):
             estimate, lower, upper = hierarchical_bootstrap(group, "distance", statistic="median")
             key_values = keys if isinstance(keys, tuple) else (keys,)
@@ -529,13 +809,17 @@ def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFram
                 }
             )
     save_frame(
-        pd.DataFrame(bootstrap_rows), Path(output_root) / "phase1_hierarchical_bootstrap.parquet"
+        pd.DataFrame(bootstrap_rows),
+        output_path / f"{output_prefix}_hierarchical_bootstrap.parquet",
     )
     collision_frame = pd.DataFrame(collision_attack_rows)
+    collision_summary_frame = pd.DataFrame()
     if not collision_frame.empty:
+        if output_prefix == "phase2":
+            collision_frame = phase2_strength_columns(collision_frame)
         save_frame(
             collision_frame,
-            Path(output_root) / "collision_attack_records_all.parquet",
+            output_path / f"{output_prefix}_collision_attack_records_all.parquet",
         )
         inferential_collisions = collision_frame[
             ~collision_frame["codebook_collapsed"].fillna(False).astype(bool)
@@ -558,14 +842,10 @@ def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFram
         ]
         save_frame(
             inferential_collisions,
-            Path(output_root) / "collision_attack_records.parquet",
+            output_path / f"{output_prefix}_collision_attack_records.parquet",
         )
         summaries = []
-        group_columns = [
-            column
-            for column in ("family", "dz", "beta", "codebook_size", "bits", "epsilon")
-            if column in inferential_collisions
-        ]
+        group_columns = _configuration_columns(inferential_collisions, "run_dir", "seed", "epsilon")
         for scope, scoped in (
             ("full_eligible", inferential_collisions),
             (
@@ -594,11 +874,96 @@ def aggregate_completed_runs(output_root: str | Path = "outputs") -> pd.DataFram
                     if column in group:
                         summary[f"mean_{column}"] = float(group[column].dropna().mean())
                 summaries.append(summary)
-        save_frame(pd.DataFrame(summaries), Path(output_root) / "collision_attack_summary.parquet")
+        collision_summary_frame = pd.DataFrame(summaries)
+        save_frame(
+            collision_summary_frame,
+            output_path / f"{output_prefix}_collision_attack_summary.parquet",
+        )
+    if output_prefix == "phase2" and not frame.empty and "family" in frame:
+        # Contrasts are paired within seed and family, with the weakest
+        # nominal bottleneck as the preregistered reference level.
+        phase2_frame = frame.copy()
+        contrast_parts = []
+        trend_parts = {}
+        for family, family_frame in phase2_frame.groupby("family", dropna=False):
+            reference = family_frame[family_frame.bottleneck_strength_ordinal == 0][
+                ["seed", "attack", "robust_auc"]
+            ].rename(columns={"robust_auc": "robust_auc_weakest"})
+            if not reference.empty:
+                contrasts = family_frame.merge(reference, on=["seed", "attack"], how="inner")
+                contrasts["paired_robust_auc_delta"] = (
+                    contrasts.robust_auc - contrasts.robust_auc_weakest
+                )
+                contrast_parts.append(contrasts)
+            for attack, attack_frame in family_frame.groupby("attack"):
+                trend_parts[f"{family}:{attack}"] = ordinal_trends(
+                    attack_frame, "bottleneck_strength_ordinal", "robust_auc"
+                )
+        all_contrasts = (
+            pd.concat(contrast_parts, ignore_index=True) if contrast_parts else pd.DataFrame()
+        )
+        save_frame(all_contrasts, output_path / "phase2_paired_contrasts.parquet")
+        all_contrasts.to_csv(output_path / "phase2_paired_contrasts.csv", index=False)
+        write_json(output_path / "phase2_ordinal_trends.json", trend_parts)
+        mean_accuracy = (
+            phase2_frame.groupby(["family", "attack", "bottleneck_strength_ordinal"], dropna=False)
+            .clean_accuracy.mean()
+            .reset_index()
+        )
+        weakest = mean_accuracy[mean_accuracy.bottleneck_strength_ordinal == 0][
+            ["family", "attack", "clean_accuracy"]
+        ].rename(columns={"clean_accuracy": "weakest_clean_accuracy"})
+        matched = mean_accuracy.merge(weakest, on=["family", "attack"], how="inner")
+        matched = matched[(matched.clean_accuracy - matched.weakest_clean_accuracy).abs() <= 0.02]
+        save_frame(matched, output_path / "phase2_accuracy_matched_configs.parquet")
+        matched_rows = phase2_frame.merge(
+            matched[["family", "attack", "bottleneck_strength_ordinal"]],
+            on=["family", "attack", "bottleneck_strength_ordinal"],
+            how="inner",
+        )
+        matched_trends = {
+            f"{family}:{attack}": ordinal_trends(group, "bottleneck_strength_ordinal", "robust_auc")
+            for (family, attack), group in matched_rows.groupby(["family", "attack"])
+        }
+        write_json(output_path / "phase2_accuracy_matched_trends.json", matched_trends)
+        synthesis = phase2_frame[phase2_frame.attack == "input_pgd"].copy()
+        if not synthesis.empty:
+            synthesis = synthesis.rename(columns={"robust_auc": "local_robustness_auc"})
+            latent = phase2_frame[phase2_frame.attack == "latent_pgd"][
+                ["run_dir", "robust_auc"]
+            ].rename(columns={"robust_auc": "latent_robustness_auc"})
+            synthesis = synthesis.merge(latent, on="run_dir", how="left")
+            synthesis["semantic_separation_robustness"] = synthesis.get(
+                "median_nearest_opposing_distance"
+            )
+            if not collision_summary_frame.empty:
+                full = collision_summary_frame[collision_summary_frame.scope == "full_eligible"]
+                collision_auc_rows = []
+                for run_name, group in full.groupby("run_dir"):
+                    group = group.sort_values("epsilon")
+                    x = group.epsilon.to_numpy(dtype=float)
+                    y = 1.0 - group.collision_success_rate.to_numpy(dtype=float)
+                    auc = (
+                        float(np.trapezoid(y, x) / (x.max() - x.min()))
+                        if len(x) > 1 and x.max() > x.min()
+                        else float(y.mean())
+                    )
+                    collision_auc_rows.append(
+                        {"run_dir": run_name, "collision_resistance_auc": auc}
+                    )
+                synthesis = synthesis.merge(
+                    pd.DataFrame(collision_auc_rows), on="run_dir", how="left"
+                )
+            save_frame(synthesis, output_path / "phase2_synthesis.parquet")
+            synthesis.to_csv(output_path / "phase2_synthesis.csv", index=False)
     return frame
 
 
-def seed_level_summary(frame: pd.DataFrame, output_root: str | Path | None = None) -> pd.DataFrame:
+def seed_level_summary(
+    frame: pd.DataFrame,
+    output_root: str | Path | None = None,
+    output_prefix: str = "phase1",
+) -> pd.DataFrame:
     """Aggregate configurations while retaining seed-level uncertainty."""
     if frame.empty:
         result = frame.copy()
@@ -627,8 +992,8 @@ def seed_level_summary(frame: pd.DataFrame, output_root: str | Path | None = Non
             for column in result.columns
         ]
     if output_root is not None:
-        save_frame(result, Path(output_root) / "phase1_seed_summary.parquet")
-        result.to_csv(Path(output_root) / "phase1_seed_summary.csv", index=False)
+        save_frame(result, Path(output_root) / f"{output_prefix}_seed_summary.parquet")
+        result.to_csv(Path(output_root) / f"{output_prefix}_seed_summary.csv", index=False)
     return result
 
 
@@ -807,6 +1172,7 @@ def validate_phase1_acceptance(output_root: str | Path = "outputs") -> dict[str,
         errors.append(f"expected one shared manifest hash, found {len(manifest_hashes)}")
     for run_dir in [*observed.values(), *identity_runs]:
         config = yaml.safe_load((run_dir / "resolved_config.yaml").read_text())
+        input_zero_predictions: pd.DataFrame | None = None
         manifest_path = Path(config["data"]["manifest"])
         if not manifest_path.exists():
             errors.append(f"missing data manifest: {manifest_path}")
@@ -819,20 +1185,33 @@ def validate_phase1_acceptance(output_root: str | Path = "outputs") -> dict[str,
             errors.append(f"missing history: {run_dir}")
         elif pd.read_parquet(history_path).select_dtypes(include=[np.number]).isna().any().any():
             errors.append(f"NaN in history: {run_dir}")
-        for required in (
-            run_dir / "artifacts" / "latents_final.safetensors",
-            run_dir / "analysis" / "geometry_final.json",
-            run_dir / "analysis" / "invariance_final.json",
-        ):
+        for required in (run_dir / "artifacts" / "latents_final.safetensors",):
             if not required.exists():
                 errors.append(f"missing artifact: {required}")
-        completed_evaluations = [
-            candidate
-            for candidate in (run_dir / "evaluations").glob("robustness-*-attempt*")
-            if (candidate / "COMPLETED").exists()
-            and (candidate / "input_pgd.parquet").exists()
-            and (candidate / "latent_pgd.parquet").exists()
-        ]
+        for kind, filename, legacy_filename in (
+            ("geometry", "geometry.json", "geometry_final.json"),
+            ("invariance", "invariance.json", "invariance_final.json"),
+        ):
+            try:
+                analysis_path = _completed_analysis_file(
+                    run_dir, kind, "final", filename, legacy_filename
+                )
+                if analysis_path is None:
+                    raise FileNotFoundError(filename)
+            except (FileNotFoundError, ValueError) as exc:
+                errors.append(f"missing or ambiguous {kind} analysis: {run_dir}: {exc}")
+        completed_evaluations = []
+        for candidate in (run_dir / "evaluations").glob("robustness-*-attempt*"):
+            config_path = candidate / "config.json"
+            if (
+                (candidate / "COMPLETED").exists()
+                and (candidate / "input_pgd.parquet").exists()
+                and (candidate / "latent_pgd.parquet").exists()
+                and config_path.exists()
+                and json.loads(config_path.read_text()).get("attack_protocol_version")
+                == ATTACK_PROTOCOL_VERSION
+            ):
+                completed_evaluations.append(candidate)
         if len(completed_evaluations) != 1:
             errors.append(
                 f"expected exactly one completed robustness evaluation for {run_dir}, "
@@ -857,6 +1236,25 @@ def validate_phase1_acceptance(output_root: str | Path = "outputs") -> dict[str,
                 counts = records.groupby("radius").sample_id.nunique()
                 if not counts.eq(len(final_ids)).all():
                     errors.append(f"incomplete per-radius records in {evaluation_dir / filename}")
+                if "attack_protocol_version" not in records or set(
+                    records.attack_protocol_version.astype(int)
+                ) != {ATTACK_PROTOCOL_VERSION}:
+                    errors.append(f"stale attack protocol in {evaluation_dir / filename}")
+                if (
+                    filename == "input_pgd.parquet"
+                    and (records.linf_norm > records.radius.astype(float) + 1e-6).any()
+                ):
+                    errors.append(f"input attack bound violation in {evaluation_dir / filename}")
+                if (
+                    filename == "latent_pgd.parquet"
+                    and (records.relative_l2_norm > records.radius.astype(float) + 1e-5).any()
+                ):
+                    errors.append(f"latent attack bound violation in {evaluation_dir / filename}")
+                if filename == "input_pgd.parquet":
+                    input_zero_predictions = records.loc[
+                        records.radius.astype(float).eq(0.0),
+                        ["sample_id", "clean_prediction"],
+                    ].drop_duplicates("sample_id")
         clean_evaluations = []
         for candidate in (run_dir / "evaluations").glob("clean-*-attempt*"):
             record_path = candidate / "clean_final.parquet"
@@ -875,10 +1273,25 @@ def validate_phase1_acceptance(output_root: str | Path = "outputs") -> dict[str,
             clean = pd.read_parquet(clean_evaluations[0])
             if set(clean.sample_id.astype(str)) != final_ids:
                 errors.append(f"incomplete clean sample IDs in {clean_evaluations[0]}")
+            if input_zero_predictions is not None:
+                comparison = clean[["sample_id", "prediction"]].merge(
+                    input_zero_predictions, on="sample_id", how="inner", validate="one_to_one"
+                )
+                mismatch_count = int(comparison.prediction.ne(comparison.clean_prediction).sum())
+                if mismatch_count:
+                    errors.append(
+                        "input radius-zero predictions disagree with clean evaluation for "
+                        f"{mismatch_count} samples: {run_dir}"
+                    )
         diagnostics = [
             candidate
             for candidate in (run_dir / "evaluations").glob("attack-diagnostics-*-attempt*")
-            if (candidate / "COMPLETED").exists() and (candidate / "diagnostics.json").exists()
+            if (candidate / "COMPLETED").exists()
+            and (candidate / "diagnostics.json").exists()
+            and json.loads((candidate / "diagnostics.json").read_text()).get(
+                "attack_protocol_version"
+            )
+            == ATTACK_PROTOCOL_VERSION
         ]
         if len(diagnostics) != 1:
             errors.append(
@@ -897,4 +1310,403 @@ def validate_phase1_acceptance(output_root: str | Path = "outputs") -> dict[str,
         "errors": errors,
     }
     write_json(output_root / "phase1_acceptance.json", report)
+    return report
+
+
+def validate_phase2_acceptance(output_root: str | Path = "outputs") -> dict[str, Any]:
+    """Validate the final artifact contract for the four new Phase 2 families."""
+    output_root = Path(output_root)
+    expected = {
+        (family, value, seed)
+        for family in ("vib", "vq", "quantized", "autoencoder")
+        for value in PHASE2_SPECS[family][1]
+        for seed in (0, 1, 2)
+    }
+    observed: dict[tuple[str, Any, int], Path] = {}
+    errors: list[str] = []
+    decision_records = sorted(Path("configs").glob("phase2_decision_*.yaml"))
+    if not decision_records:
+        errors.append("missing timestamped frozen Phase 2 decision record")
+    else:
+        for decision_record in decision_records:
+            try:
+                validate_decision_record(decision_record)
+            except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+                errors.append(f"invalid Phase 2 decision record {decision_record}: {exc}")
+    for run_dir in output_root.glob("*/*"):
+        if not (run_dir / "COMPLETED").exists():
+            continue
+        config_path = run_dir / "resolved_config.yaml"
+        if not config_path.exists():
+            continue
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        family = str(config.get("model", {}).get("family", "")).lower()
+        if family not in {key[0] for key in expected}:
+            continue
+        parameter = PHASE2_SPECS[family][0]
+        value = config.get("model", {}).get(parameter)
+        if family == "quantized":
+            value = (
+                "FP32" if value is None or str(value).lower() in {"fp32", "none"} else int(value)
+            )
+        elif family == "vib":
+            value = float(value)
+        else:
+            value = int(value)
+        key = (family, value, int(config.get("seed", -1)))
+        if key in observed:
+            errors.append(f"duplicate completed Phase 2 run {key}")
+        observed[key] = run_dir
+    for key in sorted(expected, key=lambda item: (item[0], str(item[1]), item[2])):
+        if key not in observed:
+            errors.append(f"missing Phase 2 run family={key[0]} strength={key[1]} seed={key[2]}")
+    for key, run_dir in observed.items():
+        config = yaml.safe_load((run_dir / "resolved_config.yaml").read_text(encoding="utf-8"))
+        decision_reference = config.get("phase2_decision_record")
+        if not isinstance(decision_reference, dict):
+            errors.append(f"missing embedded Phase 2 decision record: {run_dir}")
+        else:
+            decision_path = Path(decision_reference.get("path", ""))
+            if not decision_path.exists():
+                errors.append(f"missing embedded decision record path: {run_dir}")
+            else:
+                try:
+                    decision = validate_decision_record(decision_path)
+                    if decision_reference.get("sha256") != decision_record_hash(decision_path):
+                        errors.append(f"decision record hash mismatch: {run_dir}")
+                    if decision_reference.get("contents") != decision:
+                        errors.append(f"embedded decision record contents mismatch: {run_dir}")
+                except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+                    errors.append(f"invalid embedded decision record: {run_dir}: {exc}")
+        if not (run_dir / "environment.json").exists():
+            errors.append(f"missing environment metadata: {run_dir}")
+        manifest_hash_path = run_dir / "data_manifest_hash.txt"
+        if not manifest_hash_path.exists():
+            errors.append(f"missing manifest hash: {run_dir}")
+        elif Path(
+            config["data"]["manifest"]
+        ).exists() and manifest_hash_path.read_text().strip() != manifest_hash(
+            config["data"]["manifest"]
+        ):
+            errors.append(f"manifest hash mismatch: {run_dir}")
+        for required in (
+            run_dir / "history.parquet",
+            run_dir / "artifacts" / "latents_development_tune.safetensors",
+            run_dir / "artifacts" / "latents_development_tune_index.parquet",
+            run_dir / "artifacts" / "latents_final.safetensors",
+            run_dir / "artifacts" / "latents_final_index.parquet",
+        ):
+            if not required.exists():
+                errors.append(f"missing Phase 2 artifact: {required}")
+        for kind, filename, legacy_filename in (
+            ("geometry", "geometry.json", "geometry_final.json"),
+            ("invariance", "invariance.json", "invariance_final.json"),
+        ):
+            try:
+                analysis_path = _completed_analysis_file(
+                    run_dir, kind, "final", filename, legacy_filename
+                )
+                if analysis_path is None:
+                    raise FileNotFoundError(filename)
+            except (FileNotFoundError, ValueError) as exc:
+                errors.append(f"missing or ambiguous Phase 2 {kind} analysis: {run_dir}: {exc}")
+        if key[0] == "autoencoder":
+            clean_prefix = "autoencoder-clean-"
+            robustness_prefix = "autoencoder-robustness-"
+        else:
+            clean_prefix = "clean-"
+            robustness_prefix = "robustness-"
+        files = (
+            ("input_pgd_reference.parquet", "latent_pgd_reference.parquet")
+            if key[0] == "autoencoder"
+            else ("input_pgd.parquet", "latent_pgd.parquet")
+        )
+        records_by_name = {}
+        completed = [
+            candidate
+            for candidate in (run_dir / "evaluations").glob(f"{robustness_prefix}*-attempt*")
+            if (candidate / "COMPLETED").exists() and (candidate / "config.json").exists()
+        ]
+        final_robustness = [
+            candidate
+            for candidate in completed
+            if (json.loads((candidate / "config.json").read_text()).get("split") == "final")
+            and json.loads((candidate / "config.json").read_text()).get("attack_protocol_version")
+            == ATTACK_PROTOCOL_VERSION
+        ]
+        if len(final_robustness) != 1:
+            errors.append(f"expected one final robustness evaluation: {run_dir}")
+        else:
+            evaluation = final_robustness[0]
+            evaluation_config = json.loads((evaluation / "config.json").read_text())
+            if evaluation_config.get("max_samples") is not None:
+                errors.append(f"final robustness evaluation is truncated: {evaluation}")
+            for filename in files:
+                if not (evaluation / filename).exists():
+                    errors.append(f"missing final attack records: {evaluation / filename}")
+                else:
+                    records_by_name[filename] = pd.read_parquet(evaluation / filename)
+            if len(records_by_name) == 2:
+                manifest_path = Path(config["data"]["manifest"])
+                final_ids = set()
+                if manifest_path.exists():
+                    manifest = pd.read_csv(manifest_path)
+                    final_ids = set(
+                        manifest.loc[manifest.split == "final", "sample_id"].astype(str)
+                    )
+                expected_radii = {
+                    files[0]: {float(value) for value in config["attack"]["input_epsilons"]},
+                    files[1]: {0.0, *(float(value) for value in config["attack"]["latent_rhos"])},
+                }
+                for filename, records in records_by_name.items():
+                    if final_ids and set(records.sample_id.astype(str)) != final_ids:
+                        errors.append(f"incomplete final sample IDs: {evaluation / filename}")
+                    if set(records.radius.astype(float)) != expected_radii[filename]:
+                        errors.append(f"incorrect final radius grid: {evaluation / filename}")
+                    counts = records.groupby("radius").sample_id.nunique()
+                    if final_ids and not counts.eq(len(final_ids)).all():
+                        errors.append(
+                            f"incomplete final per-radius records: {evaluation / filename}"
+                        )
+                    if "attack_protocol_version" not in records or set(
+                        records.attack_protocol_version.astype(int)
+                    ) != {ATTACK_PROTOCOL_VERSION}:
+                        errors.append(f"stale attack protocol: {evaluation / filename}")
+                    if (
+                        filename == files[0]
+                        and (records.linf_norm > records.radius.astype(float) + 1e-6).any()
+                    ):
+                        errors.append(f"input attack bound violation: {evaluation / filename}")
+                    if (
+                        filename == files[1]
+                        and (records.relative_l2_norm > records.radius.astype(float) + 1e-5).any()
+                    ):
+                        errors.append(f"latent attack bound violation: {evaluation / filename}")
+            if key[0] in {"vq", "quantized"}:
+                square = [
+                    candidate
+                    for candidate in (run_dir / "evaluations").glob("square-*-attempt*")
+                    if (candidate / "COMPLETED").exists()
+                    and (candidate / "square_attack.parquet").exists()
+                    and (candidate / "config.json").exists()
+                ]
+                square = [
+                    candidate
+                    for candidate in square
+                    if json.loads((candidate / "config.json").read_text()).get("split") == "final"
+                    and json.loads((candidate / "config.json").read_text()).get(
+                        "attack_protocol_version"
+                    )
+                    == ATTACK_PROTOCOL_VERSION
+                ]
+                if len(square) != 1:
+                    errors.append(f"expected one final Square Attack evaluation: {run_dir}")
+                transfer = [
+                    candidate
+                    for candidate in (run_dir / "evaluations").glob("transfer-*-attempt*")
+                    if (candidate / "COMPLETED").exists()
+                    and (candidate / "transfer_attack.parquet").exists()
+                    and (candidate / "config.json").exists()
+                    and json.loads((candidate / "config.json").read_text()).get("split") == "final"
+                    and json.loads((candidate / "config.json").read_text()).get(
+                        "attack_protocol_version"
+                    )
+                    == ATTACK_PROTOCOL_VERSION
+                ]
+                if len(transfer) != 1:
+                    errors.append(f"expected one final nearest-capacity transfer attack: {run_dir}")
+                elif (
+                    json.loads((transfer[0] / "config.json").read_text()).get("max_samples") != 1000
+                ):
+                    errors.append(f"transfer attack does not use the registered subset: {run_dir}")
+        collision = [
+            candidate
+            for candidate in (run_dir / "evaluations").glob("collision-*-attempt*")
+            if (candidate / "COMPLETED").exists()
+            and (candidate / "collision_attacks.parquet").exists()
+            and (candidate / "config.json").exists()
+            and json.loads((candidate / "config.json").read_text()).get("split") == "final"
+            and json.loads((candidate / "config.json").read_text()).get("attack_protocol_version")
+            == ATTACK_PROTOCOL_VERSION
+        ]
+        if len(collision) != 1:
+            errors.append(f"expected one final collision evaluation: {run_dir}")
+        else:
+            collision_config = json.loads((collision[0] / "config.json").read_text())
+            tuning_artifact_value = collision_config.get("tuning_artifact")
+            tuning_artifact = Path(tuning_artifact_value) if tuning_artifact_value else None
+            if (
+                tuning_artifact is None
+                or not tuning_artifact.is_file()
+                or collision_config.get("tuning_artifact_sha256") != sha256_file(tuning_artifact)
+            ):
+                errors.append(f"collision tuning artifact is missing or changed: {run_dir}")
+            collision_records_frame = pd.read_parquet(collision[0] / "collision_attacks.parquet")
+            expected_collision_radii = {
+                0.0,
+                *(float(value) for value in config["attack"]["input_epsilons"]),
+            }
+            if set(collision_records_frame.epsilon.astype(float)) != expected_collision_radii:
+                errors.append(f"incorrect collision epsilon grid: {run_dir}")
+            if (
+                "input_bound_satisfied" not in collision_records_frame
+                or not collision_records_frame.input_bound_satisfied.astype(bool).all()
+            ):
+                errors.append(f"collision input-bound check failed: {run_dir}")
+        clean = []
+        for candidate in (run_dir / "evaluations").glob(f"{clean_prefix}*-attempt*"):
+            if not (candidate / "COMPLETED").exists():
+                continue
+            summary_path = (
+                candidate / "reconstruction_final.json"
+                if key[0] == "autoencoder"
+                else candidate / "clean_final.json"
+            )
+            record_path = (
+                candidate / "reconstruction_final.parquet"
+                if key[0] == "autoencoder"
+                else candidate / "clean_final.parquet"
+            )
+            if not summary_path.exists() or not record_path.exists():
+                continue
+            summary = json.loads(summary_path.read_text())
+            if key[0] == "autoencoder" and not {
+                "reference_original_accuracy",
+                "reconstruction_accuracy",
+                "reconstruction_mse",
+                "reconstruction_psnr_db",
+            }.issubset(summary):
+                errors.append(f"incomplete autoencoder reconstruction summary: {summary_path}")
+                continue
+            if summary.get("split") == "final" and summary.get("max_samples") is None:
+                clean.append((record_path, summary))
+        if len(clean) != 1:
+            if not clean:
+                errors.append(f"missing final clean evaluation: {run_dir}")
+            else:
+                errors.append(f"expected one final clean evaluation: {run_dir}")
+        if len(clean) == 1 and len(records_by_name) == 2:
+            clean_frame = pd.read_parquet(clean[0][0])
+            input_frame = records_by_name[files[0]]
+            zero = input_frame[input_frame.radius.astype(float).eq(0.0)]
+            prediction_column = (
+                "reconstruction_prediction" if key[0] == "autoencoder" else "prediction"
+            )
+            if prediction_column in clean_frame and not zero.empty:
+                comparison = clean_frame[["sample_id", prediction_column]].merge(
+                    zero[["sample_id", "clean_prediction"]],
+                    on="sample_id",
+                    how="inner",
+                    validate="one_to_one",
+                )
+                if comparison[prediction_column].ne(comparison.clean_prediction).any():
+                    errors.append(f"radius-zero predictions disagree with clean: {run_dir}")
+        diagnostics = [
+            candidate
+            for candidate in (run_dir / "evaluations").glob("attack-diagnostics-*-attempt*")
+            if (candidate / "COMPLETED").exists()
+            and (candidate / "diagnostics.json").exists()
+            and json.loads((candidate / "diagnostics.json").read_text()).get(
+                "attack_protocol_version"
+            )
+            == ATTACK_PROTOCOL_VERSION
+        ]
+        if key[0] == "autoencoder":
+            diagnostics += [
+                candidate
+                for candidate in (run_dir / "evaluations").glob(
+                    "autoencoder-attack-diagnostics-*-attempt*"
+                )
+                if (candidate / "COMPLETED").exists()
+                and (candidate / "diagnostics.json").exists()
+                and json.loads((candidate / "diagnostics.json").read_text()).get(
+                    "attack_protocol_version"
+                )
+                == ATTACK_PROTOCOL_VERSION
+            ]
+        if len(diagnostics) != 1:
+            errors.append(f"expected one attack correctness diagnostic: {run_dir}")
+        elif (
+            json.loads((diagnostics[0] / "diagnostics.json").read_text()).get("status") != "passed"
+        ):
+            errors.append(f"failed attack correctness diagnostics: {run_dir}")
+    report = {
+        "status": "ready" if not errors else "not_ready",
+        "expected_runs": len(expected),
+        "observed_runs": len(observed),
+        "decision_records": [str(path) for path in decision_records],
+        "errors": errors,
+    }
+    write_json(output_root / "phase2_acceptance.json", report)
+    return report
+
+
+def analyze_identity_followup(
+    output_root: str | Path = "outputs", report_path: str | Path | None = None
+) -> dict[str, Any]:
+    """Audit the required three-seed identity control without overwriting runs.
+
+    When all three controls and their final records exist, a timestamped
+    identity-vs-learned-512 aggregate is produced. With missing seeds the
+    immutable status report records the gap and leaves the prior diagnostic
+    untouched.
+    """
+    output_root = Path(output_root)
+    identity_runs = []
+    for run_dir in (output_root / "identity").glob("*"):
+        if not (run_dir / "COMPLETED").exists():
+            continue
+        config_path = run_dir / "resolved_config.yaml"
+        if not config_path.exists():
+            continue
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        if config.get("model", {}).get("family") == "identity":
+            identity_runs.append((int(config.get("seed", -1)), run_dir))
+    seeds = sorted(seed for seed, _ in identity_runs)
+    duplicate_seeds = sorted(seed for seed in set(seeds) if seeds.count(seed) > 1)
+    missing = sorted({0, 1, 2} - set(seeds))
+    artifact_gaps = []
+    for seed, run_dir in identity_runs:
+        required = (
+            run_dir / "artifacts" / "latents_final.safetensors",
+            run_dir / "artifacts" / "latents_final_index.parquet",
+        )
+        analyses_present = True
+        for kind, filename, legacy_filename in (
+            ("geometry", "geometry.json", "geometry_final.json"),
+            ("invariance", "invariance.json", "invariance_final.json"),
+        ):
+            try:
+                analysis_path = _completed_analysis_file(
+                    run_dir, kind, "final", filename, legacy_filename
+                )
+                if analysis_path is None:
+                    raise FileNotFoundError(filename)
+            except (FileNotFoundError, ValueError):
+                analyses_present = False
+        if any(not path.exists() for path in required) or not analyses_present:
+            artifact_gaps.append({"seed": seed, "run_dir": str(run_dir)})
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    if report_path is None:
+        report_path = output_root / f"phase1_identity_followup_{timestamp}.json"
+    report = {
+        "status": (
+            "ready" if not missing and not duplicate_seeds and not artifact_gaps else "blocked"
+        ),
+        "expected_seeds": [0, 1, 2],
+        "completed_seeds": seeds,
+        "missing_seeds": missing,
+        "duplicate_seeds": duplicate_seeds,
+        "artifact_gaps": artifact_gaps,
+        "prior_diagnostic_preserved": (output_root / "phase1_identity_diagnostic.parquet").exists(),
+    }
+    if report["status"] == "ready":
+        aggregate_prefix = f"phase1_identity_followup_{timestamp}"
+        aggregate_completed_runs(
+            output_root,
+            output_prefix=aggregate_prefix,
+            include_families=["identity", "dimensional"],
+        )
+        report["aggregate_prefix"] = aggregate_prefix
+    write_json(Path(report_path), report)
     return report

@@ -1,3 +1,8 @@
+from pathlib import Path
+
+import pytest
+import yaml
+
 from ribs.cli import build_parser
 
 
@@ -24,3 +29,62 @@ def test_phase2_matrix_requires_and_records_decision_argument():
         ]
     )
     assert args.decision_record.endswith("phase2_decision.example.yaml")
+
+
+def test_phase2_matrix_has_fixed_strengths():
+    import pandas as pd
+
+    from ribs.phase2 import PHASE2_SPECS, ordinal_strength, phase2_strength_columns
+
+    assert len(PHASE2_SPECS["vib"][1]) == 6
+    assert ordinal_strength("vq", 512) == 0
+    assert ordinal_strength("vq", 16) == 5
+    assert ordinal_strength("quantized", "FP32") == 0
+    mixed = phase2_strength_columns(
+        pd.DataFrame(
+            [
+                {"family": "quantized", "bits": "FP32", "dz": 128},
+                {"family": "quantized", "bits": 8, "dz": 128},
+                {"family": "vq", "codebook_size": 512},
+            ]
+        )
+    )
+    assert mixed.bits.dropna().tolist() == ["FP32", "8"]
+    assert mixed.strength_value.tolist() == ["FP32", "8", "512"]
+
+
+def test_frozen_decision_record_schema_is_valid():
+    from ribs.phase2 import validate_decision_record
+
+    record = validate_decision_record("configs/phase2_decision_20260902T120000.yaml")
+    assert record["seeds"]["training"] == [0, 1, 2]
+
+
+def test_decision_record_rejects_strength_drift(tmp_path):
+    from ribs.phase2 import validate_decision_record
+
+    record = yaml.safe_load(Path("configs/phase2_decision_20260902T120000.yaml").read_text())
+    record["included_model_families_and_strengths"]["vib"]["values"][-1] = 0.02
+    path = tmp_path / "drifted.yaml"
+    path.write_text(yaml.safe_dump(record))
+    with pytest.raises(ValueError, match="strengths differ"):
+        validate_decision_record(path)
+
+
+def test_identity_followup_reuses_valid_completed_control(tmp_path):
+    from ribs.phase2 import valid_identity_run
+
+    run_dir = tmp_path / "identity" / "historical-seed0"
+    (run_dir / "checkpoints").mkdir(parents=True)
+    (run_dir / "history.parquet").write_bytes(b"history")
+    (run_dir / "metrics.json").write_bytes(b"{}")
+    (run_dir / "checkpoints" / "best_tune_accuracy.pt").write_bytes(b"checkpoint")
+    (run_dir / "COMPLETED").write_text("completed\n")
+    (run_dir / "data_manifest_hash.txt").write_text("placeholder\n")
+    # An unavailable manifest hash is still allowed for the helper's structural
+    # test when the current config points to a missing manifest.
+    config = {"data": {"manifest": str(tmp_path / "missing.csv")}}
+    (run_dir / "resolved_config.yaml").write_text(
+        "model:\n  family: identity\n  dz: 512\nseed: 0\n"
+    )
+    assert valid_identity_run(tmp_path, 0, config) == run_dir
