@@ -80,15 +80,42 @@ Copy `configs/phase2_decision.example.yaml`, fill it with the frozen Phase 2
 decision, and save it as a new decision record before launching the matrix.
 Its contents and SHA-256 hash are embedded in every Phase 2 resolved config.
 
+The required identity-control follow-up and Phase 2 postprocessing are:
+
+```bash
+./scripts/run_identity_followup.sh configs/phase1.yaml
+./scripts/run_phase2.sh configs configs/phase2_decision_YYYYMMDDTHHMMSS.yaml
+PYTHONPATH=src python -m ribs.cli validate-phase2 --output-root outputs
+```
+
+On a four-GPU host, the independent strength configurations can instead be
+queued safely with `scripts/run_phase2_parallel.sh`; set `GPU_COUNT` when a
+different number of idle GPUs is available. Each queued job retains all three
+seeds and writes a separate log.
+
+`run_phase2.sh` performs the four family sweeps and then evaluates, aggregates,
+plots, and validates completed runs. It stops on a failed command so failures
+can be recorded and the matrix safely resumed.
+
 For the autoencoder family, first train a reference classifier with
 `train-reference`, then use `evaluate-autoencoder` and `autoencoder-attack`
 with the two run directories. Discrete models should also be checked with
 `square-attack`; their latent evaluation writes separate pre-quantization and
 post-bottleneck attack files. Before running final targeted-collision analyses,
-set `collision.tuned=true` only after the collision loss weights have been fixed
-on the tuning split. Cross-model input transfer is available through
-`transfer-attack --source-run-dir ... --run-dir ...`; the command rejects
-runs that do not share the same dataset manifest.
+freeze the loss weight on the tuning split and pass its immutable artifact to
+the final run:
+
+```bash
+python -m ribs.cli tune-collision --run-dir RUN --reference-run-dir REFERENCE \
+  --lambdas 0.1 0.3 1 3 10
+python -m ribs.cli collision-attack --run-dir RUN --reference-run-dir REFERENCE \
+  --tuning-artifact RUN/evaluations/collision-tuning-.../selection.json
+```
+
+Cross-model input transfer is available through `transfer-attack
+--source-run-dir ... --run-dir ...`; the command checks the dataset manifest
+and verifies that the selected continuous source is the same-seed model with
+nearest measured effective rank.
 
 Use `--set train.epochs=2 --set train.batch_size=2 --set data.image_size=32`
 for a small development run. All important outputs are machine-readable and
