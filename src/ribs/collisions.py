@@ -102,9 +102,11 @@ def targeted_collision_attack(
     best_distance = torch.full((source.shape[0],), float("inf"), device=source.device)
     best_score = torch.full((source.shape[0],), float("inf"), device=source.device)
     best_success = torch.zeros(source.shape[0], dtype=torch.bool, device=source.device)
+    attack_steps = max(0, int(steps)) if epsilon > 0 else 0
+    attack_restarts = max(1, int(restarts)) if epsilon > 0 else 1
     with _seeded_rng(source, seed):
         generator = torch.Generator(device=source.device).manual_seed(seed + 1)
-        for restart in range(restarts):
+        for restart in range(attack_restarts):
             if restart == 0:
                 adv = source.detach().clone()
             else:
@@ -114,7 +116,7 @@ def targeted_collision_attack(
                     source,
                     epsilon,
                 )
-            for _ in range(steps + 1):
+            for step_index in range(attack_steps + 1):
                 adv.requires_grad_(True)
                 output = model(adv, sample=False)
                 normalized = F.normalize(
@@ -142,7 +144,6 @@ def targeted_collision_attack(
                     reference_classifier(adv).logits.float(), source_label, reduction="none"
                 )
                 objective = attack_distance + lambda_sem * source_loss
-                grad = torch.autograd.grad(objective.sum(), adv)[0]
                 with torch.no_grad():
                     reference_prediction = reference_classifier(adv).logits.argmax(dim=-1)
                     success = (reference_prediction == source_label) & collision_condition
@@ -153,11 +154,15 @@ def targeted_collision_attack(
                     best_distance = torch.where(replace, normalized_distance, best_distance)
                     best_score = torch.where(replace, attack_distance, best_score)
                     best_success = torch.where(replace, success, best_success)
+                if step_index == attack_steps:
+                    break
+                grad = torch.autograd.grad(objective.sum(), adv)[0]
+                with torch.no_grad():
                     direction = grad / grad.flatten(1).norm(dim=1).clamp_min(1e-12).view(
                         -1, 1, 1, 1
                     )
                     adv = _project_linf(
-                        adv.detach() - (2 * epsilon / max(1, steps)) * direction,
+                        adv.detach() - (2 * epsilon / max(1, attack_steps)) * direction,
                         source,
                         epsilon,
                     )

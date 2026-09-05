@@ -50,6 +50,14 @@ def test_uniform_quantizer_is_bounded_and_discrete():
     assert len(torch.unique(quantized)) <= 4
 
 
+def test_uniform_quantizer_has_expected_levels_rounding_and_clamps():
+    values = torch.tensor([-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0])
+    quantized = quantize_uniform(values, 2)
+    expected = torch.tensor([-1.0, -1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 1.0, 1.0])
+    assert torch.allclose(quantized, expected)
+    assert torch.unique(quantized).numel() <= 2**2
+
+
 def test_prequantization_attack_uses_family_surface():
     model = VQBottleneck(codebook_size=4).eval()
     x = torch.rand(2, 3, 32, 32)

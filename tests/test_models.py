@@ -58,3 +58,47 @@ def test_dimensional_model_overfits_fixed_batch():
         loss.backward()
         optimizer.step()
     assert (model(images).logits.argmax(1) == labels).float().mean() == 1.0
+
+
+@pytest.mark.parametrize(
+    "family_config",
+    [
+        {"family": "vib", "dz": 8, "beta": 0.0},
+        {"family": "vq", "codebook_size": 8},
+        {"family": "quantized", "dz": 8, "bits": 3},
+    ],
+)
+def test_new_classification_families_overfit_fixed_batch(family_config):
+    torch.manual_seed(1)
+    model = create_model({"model": family_config})
+    model.backbone = torch.nn.Sequential(torch.nn.Flatten(), torch.nn.Linear(3 * 4 * 4, 512))
+    labels = torch.arange(8) % 2
+    images = torch.zeros(8, 3, 4, 4)
+    images.flatten(1)[torch.arange(8), labels] = 1.0
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
+    model.train()
+    initial = float(torch.nn.functional.cross_entropy(model(images).logits, labels))
+    for _ in range(15):
+        optimizer.zero_grad()
+        loss = torch.nn.functional.cross_entropy(model(images).logits, labels)
+        loss.backward()
+        optimizer.step()
+    assert float(torch.nn.functional.cross_entropy(model(images).logits, labels)) < initial
+
+
+def test_autoencoder_overfits_fixed_batch():
+    torch.manual_seed(2)
+    model = create_model({"model": {"family": "autoencoder", "dz": 8}, "data": {"image_size": 32}})
+    model.backbone = torch.nn.Sequential(torch.nn.Flatten(), torch.nn.Linear(3 * 32 * 32, 512))
+    images = torch.rand(2, 3, 32, 32)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
+    model.train()
+    initial = float(torch.nn.functional.mse_loss(model(images).metadata["reconstruction"], images))
+    for _ in range(8):
+        optimizer.zero_grad()
+        reconstruction = model(images).metadata["reconstruction"]
+        loss = torch.nn.functional.mse_loss(reconstruction, images)
+        loss.backward()
+        optimizer.step()
+    final = float(torch.nn.functional.mse_loss(model(images).metadata["reconstruction"], images))
+    assert final < initial

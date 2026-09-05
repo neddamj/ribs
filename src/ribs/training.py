@@ -69,6 +69,26 @@ def _loader(config: dict[str, Any], split: str, shuffle: bool) -> DataLoader:
     )
 
 
+def _training_batches(loader: DataLoader, augmentation_generator: torch.Generator):
+    """Keep main-process augmentation draws separate from model randomness."""
+    if loader.num_workers > 0:
+        yield from loader
+        return
+    iterator = iter(loader)
+    while True:
+        model_rng_state = torch.get_rng_state()
+        torch.set_rng_state(augmentation_generator.get_state())
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            augmentation_generator.set_state(torch.get_rng_state())
+            torch.set_rng_state(model_rng_state)
+            break
+        augmentation_generator.set_state(torch.get_rng_state())
+        torch.set_rng_state(model_rng_state)
+        yield batch
+
+
 def _optimizer(model: BottleneckModel, config: dict[str, Any]) -> AdamW:
     decay, no_decay = [], []
     for name, parameter in model.named_parameters():
@@ -145,6 +165,27 @@ def batch_loss(
     return loss, values
 
 
+def resolve_training_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Materialize all seed defaults before hashing or writing a run config."""
+    config = copy.deepcopy(config)
+    validate_config(config)
+    seed = int(config.get("seed", 0))
+    seeds = config.setdefault("random_seeds", {})
+    seed_defaults = {
+        "model_initialization": seed,
+        "data_order": seed + 17,
+        "augmentation": seed + 1000,
+        "stochastic_bottleneck": seed + 3000,
+        "evaluation_order": seed + 31,
+        "evaluation_workers": seed + 2000,
+        "attack": int(config.get("attack", {}).get("seed", 2025)),
+    }
+    for name, value in seed_defaults.items():
+        seeds.setdefault(name, value)
+    config["attack"].setdefault("seed", config["random_seeds"]["attack"])
+    return config
+
+
 @torch.no_grad()
 def evaluate_reconstruction_mse(
     model: AutoencoderBottleneck, loader: DataLoader, device: torch.device
@@ -196,22 +237,8 @@ def evaluate_clean(
 
 
 def train_model(config: dict[str, Any]) -> Path:
-    config = copy.deepcopy(config)
-    validate_config(config)
+    config = resolve_training_config(config)
     seed = int(config.get("seed", 0))
-    seeds = config.setdefault("random_seeds", {})
-    seed_defaults = {
-        "model_initialization": seed,
-        "data_order": seed + 17,
-        "augmentation": seed + 1000,
-        "stochastic_bottleneck": seed + 3000,
-        "evaluation_order": seed + 31,
-        "evaluation_workers": seed + 2000,
-        "attack": int(config.get("attack", {}).get("seed", 2025)),
-    }
-    for name, value in seed_defaults.items():
-        seeds.setdefault(name, value)
-    config["attack"].setdefault("seed", config["random_seeds"]["attack"])
     seed_everything(int(config["random_seeds"]["model_initialization"]))
     run = RunDirectory(config)
     data_hash = manifest_hash(config["data"]["manifest"])
@@ -246,6 +273,9 @@ def train_model(config: dict[str, Any]) -> Path:
     best_epoch = -1
     collapse_epochs = 0
     codebook_collapsed = False
+    augmentation_generator = torch.Generator().manual_seed(
+        int(config["random_seeds"]["augmentation"])
+    )
     start_epoch = 0
     resume_path = config.get("resume")
     if resume_path:
@@ -271,11 +301,16 @@ def train_model(config: dict[str, Any]) -> Path:
         if "numpy_rng_state" in state:
             np.random.set_state(state["numpy_rng_state"])
         if "torch_rng_state" in state:
-            torch.set_rng_state(state["torch_rng_state"])
+            torch_rng_state = state["torch_rng_state"]
+            # ``map_location=device`` moves every tensor in the checkpoint to
+            # CUDA, but the default torch generator is CPU-backed.
+            torch.set_rng_state(torch_rng_state.cpu())
         if torch.cuda.is_available() and state.get("cuda_rng_state") is not None:
-            torch.cuda.set_rng_state_all(state["cuda_rng_state"])
+            torch.cuda.set_rng_state_all([rng_state.cpu() for rng_state in state["cuda_rng_state"]])
         if "data_loader_rng_state" in state and train_loader.generator is not None:
-            train_loader.generator.set_state(state["data_loader_rng_state"])
+            train_loader.generator.set_state(state["data_loader_rng_state"].cpu())
+        if "augmentation_rng_state" in state:
+            augmentation_generator.set_state(state["augmentation_rng_state"].cpu())
         start_epoch = int(state["epoch"]) + 1
         previous_run = resume_path.parent.parent
         history_path = previous_run / "history.parquet"
@@ -310,7 +345,9 @@ def train_model(config: dict[str, Any]) -> Path:
         running: list[float] = []
         extra_values: dict[str, list[float]] = {}
         epoch_code_counts: torch.Tensor | None = None
-        for batch_index, batch in enumerate(train_loader):
+        for batch_index, batch in enumerate(
+            _training_batches(train_loader, augmentation_generator)
+        ):
             group_start = (batch_index // accumulation) * accumulation
             group_size = min(accumulation, len(train_loader) - group_start)
             with _autocast(device, config):
@@ -394,6 +431,7 @@ def train_model(config: dict[str, Any]) -> Path:
             "data_loader_rng_state": (
                 train_loader.generator.get_state() if train_loader.generator is not None else None
             ),
+            "augmentation_rng_state": augmentation_generator.get_state(),
         }
         torch.save(checkpoint, run.path / "checkpoints" / "last.pt")
         improved = current_metric < best_metric if is_autoencoder else current_metric > best_metric

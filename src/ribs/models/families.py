@@ -149,7 +149,8 @@ def quantize_uniform(z: Tensor, bits: int) -> Tensor:
     if bits < 1:
         raise ValueError("bits must be positive")
     levels = 2**bits - 1
-    return 2.0 * torch.round((z + 1.0) * levels / 2.0) / levels - 1.0
+    bounded = z.clamp(-1.0, 1.0)
+    return 2.0 * torch.round((bounded + 1.0) * levels / 2.0) / levels - 1.0
 
 
 class QuantizedContinuousBottleneck(BottleneckModel):

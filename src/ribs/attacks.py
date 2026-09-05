@@ -71,6 +71,7 @@ def input_pgd(
     restarts: int = 5,
     eot_samples: int = 1,
     seed: int = 0,
+    initial_adversarial: Tensor | None = None,
 ) -> AttackResult:
     model.eval()
     x = x.detach().float()
@@ -88,17 +89,42 @@ def input_pgd(
         best_loss = initial_loss.detach().clone()
         best_success = clean_pred.ne(y)
         best_restart = initial_restart
-        step_size = 2.0 * epsilon / max(1, steps)
+        if initial_adversarial is not None:
+            candidate = initial_adversarial.detach().float()
+            if candidate.shape != x.shape:
+                raise ValueError("Initial input candidate has the wrong shape")
+            if (candidate - x).abs().flatten(1).amax(1).max() > epsilon + 1e-6:
+                raise ValueError("Initial input candidate is outside the attack constraint")
+            with torch.no_grad():
+                candidate_loss, candidate_probabilities = _eot_loss(
+                    model, candidate, y, eot_samples
+                )
+                candidate_success = candidate_probabilities.argmax(dim=-1).ne(y)
+                replace = (candidate_success & ~best_success) | (
+                    candidate_success == best_success
+                ) & (candidate_loss > best_loss)
+                best_x, best_loss, best_success = _select(
+                    best_x,
+                    best_loss,
+                    best_success,
+                    candidate,
+                    candidate_loss,
+                    candidate_success,
+                )
+                best_restart = torch.where(replace, torch.full_like(best_restart, -2), best_restart)
+        attack_steps = max(1, steps)
+        step_size = 2.0 * epsilon / attack_steps
         for restart in range(restarts):
             adv = (
                 (x + torch.empty_like(x).uniform_(-epsilon, epsilon, generator=generator))
                 .clamp(0.0, 1.0)
                 .detach()
             )
-            for _ in range(steps + 1):
+            # Evaluate the initialization and every updated point, including
+            # the candidate produced by the final gradient step.
+            for step_index in range(attack_steps + 1):
                 adv.requires_grad_(True)
                 losses, probabilities = _eot_loss(model, adv, y, eot_samples)
-                grad = torch.autograd.grad(losses.sum(), adv)[0]
                 success = probabilities.detach().argmax(dim=-1).ne(y)
                 with torch.no_grad():
                     replace = (success & ~best_success) | (success == best_success) & (
@@ -110,6 +136,10 @@ def input_pgd(
                     best_restart = torch.where(
                         replace, torch.full_like(best_restart, restart), best_restart
                     )
+                if step_index == attack_steps:
+                    break
+                grad = torch.autograd.grad(losses.sum(), adv)[0]
+                with torch.no_grad():
                     adv = (adv.detach() + step_size * grad.sign()).clamp(0.0, 1.0)
                     adv = torch.max(torch.min(adv, x + epsilon), x - epsilon).clamp(0.0, 1.0)
         if torch.any(best_loss + 1e-6 < initial_loss):
@@ -127,6 +157,24 @@ def project_l2(delta: Tensor, radius: Tensor) -> Tensor:
     return delta * factor.view(-1, 1, *([1] * (delta.ndim - 2)))
 
 
+def _uniform_l2_noise(reference: Tensor, radius: Tensor, generator: torch.Generator) -> Tensor:
+    """Draw independently and uniformly from each sample's L2 ball."""
+    noise = torch.randn(
+        reference.shape,
+        generator=generator,
+        device=reference.device,
+        dtype=reference.dtype,
+    )
+    flat_norm = noise.flatten(1).norm(dim=1).clamp_min(1e-12)
+    direction = noise / flat_norm.view(-1, *([1] * (noise.ndim - 1)))
+    dimension = max(1, noise[0].numel())
+    radial = torch.rand(reference.shape[0], device=reference.device, generator=generator).pow(
+        1.0 / dimension
+    )
+    scale = radius * radial
+    return direction * scale.view(-1, *([1] * (noise.ndim - 1)))
+
+
 def latent_pgd(
     model: torch.nn.Module,
     x: Tensor,
@@ -135,6 +183,7 @@ def latent_pgd(
     steps: int = 40,
     restarts: int = 5,
     seed: int = 0,
+    initial_adversarial: Tensor | None = None,
 ) -> AttackResult:
     model.eval()
     with torch.no_grad():
@@ -149,30 +198,60 @@ def latent_pgd(
     best_loss = initial_loss.clone()
     best_success = clean_pred.ne(y)
     step = 2.0 * radius / max(1, steps)
-    for _ in range(restarts):
-        noise = torch.randn(z.shape, generator=generator, device=z.device, dtype=z.dtype)
-        dimension = max(1, noise[0].numel())
-        radial = torch.rand(z.shape[0], device=z.device, generator=generator).pow(1.0 / dimension)
-        noise = project_l2(noise, radius * radial)
+    best_restart = torch.full_like(y, -1, dtype=torch.long)
+    if initial_adversarial is not None:
+        candidate = initial_adversarial.detach()
+        if candidate.shape != z.shape:
+            raise ValueError("Initial latent candidate has the wrong shape")
+        if torch.any((candidate - z).flatten(1).norm(dim=1) > radius + 1e-6):
+            raise ValueError("Initial latent candidate is outside the attack constraint")
+        with torch.no_grad():
+            candidate_logits = model.classify_latent(candidate)
+            candidate_loss = F.cross_entropy(candidate_logits.float(), y, reduction="none")
+            candidate_success = candidate_logits.argmax(dim=-1).ne(y)
+            replace = (candidate_success & ~best_success) | (candidate_success == best_success) & (
+                candidate_loss > best_loss
+            )
+            best_z, best_loss, best_success = _select(
+                best_z,
+                best_loss,
+                best_success,
+                candidate,
+                candidate_loss,
+                candidate_success,
+            )
+            best_restart = torch.where(replace, torch.full_like(best_restart, -2), best_restart)
+    attack_steps = max(1, steps)
+    for restart in range(restarts):
+        noise = _uniform_l2_noise(z, radius, generator)
         adv = z + noise
-        for _ in range(steps + 1):
+        for step_index in range(attack_steps + 1):
             adv.requires_grad_(True)
             logits = model.classify_latent(adv)
             losses = F.cross_entropy(logits.float(), y, reduction="none")
+            success = logits.detach().argmax(dim=-1).ne(y)
+            with torch.no_grad():
+                replace = (success & ~best_success) | (success == best_success) & (
+                    losses > best_loss
+                )
+                best_z, best_loss, best_success = _select(
+                    best_z, best_loss, best_success, adv.detach(), losses.detach(), success
+                )
+                best_restart = torch.where(
+                    replace, torch.full_like(best_restart, restart), best_restart
+                )
+            if step_index == attack_steps:
+                break
             grad = torch.autograd.grad(losses.sum(), adv)[0]
             direction = grad / grad.flatten(1).norm(dim=1).clamp_min(1e-12).view(
                 -1, *([1] * (grad.ndim - 1))
             )
-            success = logits.detach().argmax(dim=-1).ne(y)
             with torch.no_grad():
-                best_z, best_loss, best_success = _select(
-                    best_z, best_loss, best_success, adv.detach(), losses.detach(), success
-                )
                 adv = adv.detach() + direction * step.view(-1, *([1] * (adv.ndim - 1)))
                 adv = z + project_l2(adv - z, radius)
     if torch.any(best_loss + 1e-6 < initial_loss):
         raise RuntimeError("Latent PGD retained loss is below its clean initial loss")
-    return AttackResult(best_z, best_loss, best_success, initial_loss)
+    return AttackResult(best_z, best_loss, best_success, initial_loss, best_restart)
 
 
 def prequantization_latent_pgd(
@@ -183,6 +262,7 @@ def prequantization_latent_pgd(
     steps: int = 40,
     restarts: int = 5,
     seed: int = 0,
+    initial_adversarial: Tensor | None = None,
 ) -> AttackResult:
     """Attack a continuous encoder output and reapply exact quantization.
 
@@ -205,27 +285,55 @@ def prequantization_latent_pgd(
     best_loss = initial_loss.clone()
     best_success = clean_pred.ne(y)
     step = 2.0 * radius / max(1, steps)
-    for _ in range(restarts):
-        noise = torch.randn(pre.shape, generator=generator, device=pre.device, dtype=pre.dtype)
-        dimension = max(1, noise[0].numel())
-        radial = torch.rand(pre.shape[0], device=pre.device, generator=generator).pow(
-            1.0 / dimension
-        )
-        noise = project_l2(noise, radius * radial)
+    best_restart = torch.full_like(y, -1, dtype=torch.long)
+    if initial_adversarial is not None:
+        candidate = initial_adversarial.detach().flatten(1)
+        if candidate.shape != pre.shape:
+            raise ValueError("Initial pre-quantization candidate has the wrong shape")
+        if torch.any((candidate - pre).norm(dim=1) > radius + 1e-6):
+            raise ValueError("Initial pre-quantization candidate is outside the attack constraint")
+        with torch.no_grad():
+            candidate_logits = model.classify_pre_bottleneck(candidate)
+            candidate_loss = F.cross_entropy(candidate_logits.float(), y, reduction="none")
+            candidate_success = candidate_logits.argmax(dim=-1).ne(y)
+            replace = (candidate_success & ~best_success) | (candidate_success == best_success) & (
+                candidate_loss > best_loss
+            )
+            best, best_loss, best_success = _select(
+                best,
+                best_loss,
+                best_success,
+                candidate,
+                candidate_loss,
+                candidate_success,
+            )
+            best_restart = torch.where(replace, torch.full_like(best_restart, -2), best_restart)
+    attack_steps = max(1, steps)
+    for restart in range(restarts):
+        noise = _uniform_l2_noise(pre, radius, generator)
         adv = pre + noise
-        for _ in range(steps + 1):
+        for step_index in range(attack_steps + 1):
             adv.requires_grad_(True)
             logits = model.classify_pre_bottleneck(adv)
             losses = F.cross_entropy(logits.float(), y, reduction="none")
-            grad = torch.autograd.grad(losses.sum(), adv)[0]
-            direction = grad / grad.flatten(1).norm(dim=1).clamp_min(1e-12).view(-1, 1)
             success = logits.detach().argmax(dim=-1).ne(y)
             with torch.no_grad():
+                replace = (success & ~best_success) | (success == best_success) & (
+                    losses > best_loss
+                )
                 best, best_loss, best_success = _select(
                     best, best_loss, best_success, adv.detach(), losses.detach(), success
                 )
+                best_restart = torch.where(
+                    replace, torch.full_like(best_restart, restart), best_restart
+                )
+            if step_index == attack_steps:
+                break
+            grad = torch.autograd.grad(losses.sum(), adv)[0]
+            direction = grad / grad.flatten(1).norm(dim=1).clamp_min(1e-12).view(-1, 1)
+            with torch.no_grad():
                 adv = adv.detach() + direction * step.view(-1, 1)
                 adv = pre + project_l2(adv - pre, radius)
     if torch.any(best_loss + 1e-6 < initial_loss):
         raise RuntimeError("Pre-quantization PGD retained loss is below its initial loss")
-    return AttackResult(best, best_loss, best_success, initial_loss)
+    return AttackResult(best, best_loss, best_success, initial_loss, best_restart)

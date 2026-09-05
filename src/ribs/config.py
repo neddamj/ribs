@@ -73,3 +73,5 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("Missing model.beta for VIB")
     if family == "vq" and "codebook_size" not in config["model"]:
         raise ValueError("Missing model.codebook_size for VQ")
+    if family in {"quantized", "quantized_continuous"} and "bits" not in config["model"]:
+        raise ValueError(f"Missing model.bits for family={family}")
