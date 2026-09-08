@@ -6,6 +6,7 @@ decision_record="${2:?usage: scripts/run_phase2_postprocess.sh [config-root] PHA
 output_root="${OUTPUT_ROOT:-outputs}"
 python_bin="${PYTHON_BIN:-python}"
 export PYTHONPATH="${PYTHONPATH:-}:src"
+read -r -a phase2_families <<< "${PHASE2_FAMILIES:-vib vq quantized autoencoder}"
 
 if ! "${python_bin}" -c 'import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)'; then
   echo "CUDA is required for the prescribed Phase 2 final evaluation; refusing CPU execution" >&2
@@ -142,15 +143,22 @@ process_run() {
   echo "DONE phase2 postprocess family=${family} run=${run_dir} $(date -Is)"
 }
 
-for family in vib vq quantized autoencoder; do
-  while IFS= read -r run_dir; do
-    process_run "${run_dir}" "${family}"
-  done < <(find "${output_root}/${family}" -mindepth 1 -maxdepth 1 -type f -name COMPLETED \
-    -printf '%h\n' 2>/dev/null | sort)
+duplicate_audit="${PHASE2_AUDIT_PATH:-${output_root}/phase2_duplicate_provenance_$(date -u +%Y%m%dT%H%M%SZ).json}"
+mapfile -t canonical_entries < <(
+  "${python_bin}" -m ribs.cli phase2-run-dirs \
+    --output-root "${output_root}" \
+    --families "${phase2_families[@]}" \
+    --audit-path "${duplicate_audit}"
+)
+for entry in "${canonical_entries[@]}"; do
+  IFS=$'\t' read -r family run_dir <<< "${entry}"
+  process_run "${run_dir}" "${family}"
 done
 
-"${python_bin}" -m ribs.cli aggregate --output-root "${output_root}" --experiment phase2 \
-  --include-families dimensional vib vq quantized autoencoder
-"${python_bin}" -m ribs.cli render --experiment phase2 \
-  --summary "${output_root}/phase2_summary.parquet" --output-dir "${output_root}/figures_phase2"
-"${python_bin}" -m ribs.cli validate-phase2 --output-root "${output_root}"
+if [[ "${PHASE2_FINALIZE:-true}" == true ]]; then
+  "${python_bin}" -m ribs.cli aggregate --output-root "${output_root}" --experiment phase2 \
+    --include-families dimensional vib vq quantized autoencoder
+  "${python_bin}" -m ribs.cli render --experiment phase2 \
+    --summary "${output_root}/phase2_summary.parquet" --output-dir "${output_root}/figures_phase2"
+  "${python_bin}" -m ribs.cli validate-phase2 --output-root "${output_root}"
+fi

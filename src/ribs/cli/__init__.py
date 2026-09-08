@@ -29,7 +29,12 @@ from ..evaluation import (
     extract_latents,
     tune_collision_lambda,
 )
-from ..phase2 import valid_identity_run, validate_decision_record
+from ..phase2 import (
+    canonical_completed_runs,
+    valid_identity_run,
+    validate_decision_record,
+    write_duplicate_provenance,
+)
 from ..training import train_model
 
 
@@ -150,6 +155,10 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--output-root", default="outputs")
     validate2 = subparsers.add_parser("validate-phase2")
     validate2.add_argument("--output-root", default="outputs")
+    run_manifest = subparsers.add_parser("phase2-run-dirs")
+    run_manifest.add_argument("--output-root", default="outputs")
+    run_manifest.add_argument("--families", nargs="+", required=True)
+    run_manifest.add_argument("--audit-path", required=True)
     identity_followup = subparsers.add_parser("analyze-identity-followup")
     identity_followup.add_argument("--output-root", default="outputs")
     identity_followup.add_argument("--report-path")
@@ -254,6 +263,12 @@ def main(argv: list[str] | None = None) -> int:
         report = analyze_identity_followup(args.output_root, args.report_path)
         print(report)
         return 0 if report["status"] == "ready" else 2
+    if args.command == "phase2-run-dirs":
+        canonical, _ = canonical_completed_runs(args.output_root, tuple(args.families))
+        write_duplicate_provenance(args.output_root, args.audit_path, tuple(args.families))
+        for run_dir in canonical:
+            print(f"{run_dir.parent.name}\t{run_dir}")
+        return 0
     if args.command in {"render", "aggregate", "validate-phase1", "validate-phase2"}:
         if args.command == "render":
             from ..plotting import render_phase1, render_phase2
