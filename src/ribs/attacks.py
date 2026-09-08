@@ -62,6 +62,33 @@ def _eot_loss(model: torch.nn.Module, x: Tensor, y: Tensor, samples: int) -> tup
     return torch.stack(losses).mean(0), probabilities / max(1, samples)
 
 
+def _eot_loss_with_gradient(
+    model: torch.nn.Module, x: Tensor, y: Tensor, samples: int
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Compute EoT values and gradient without retaining all sample graphs.
+
+    The prescribed EoT count is unchanged. Each stochastic forward is
+    differentiated and released before the next one, so memory scales with a
+    single sample graph rather than with the number of EoT samples.
+    """
+    count = max(1, samples)
+    losses = []
+    probabilities = []
+    gradient = torch.zeros_like(x)
+    for _ in range(count):
+        output = model(x, sample=count > 1)
+        logits = output.logits.float()
+        current_loss = F.cross_entropy(logits, y, reduction="none")
+        gradient = gradient + torch.autograd.grad(current_loss.sum(), x)[0]
+        losses.append(current_loss.detach())
+        probabilities.append(torch.softmax(logits.detach(), dim=-1))
+    return (
+        torch.stack(losses).mean(0),
+        torch.stack(probabilities).mean(0),
+        gradient / count,
+    )
+
+
 def input_pgd(
     model: torch.nn.Module,
     x: Tensor,
@@ -124,7 +151,7 @@ def input_pgd(
             # the candidate produced by the final gradient step.
             for step_index in range(attack_steps + 1):
                 adv.requires_grad_(True)
-                losses, probabilities = _eot_loss(model, adv, y, eot_samples)
+                losses, probabilities, grad = _eot_loss_with_gradient(model, adv, y, eot_samples)
                 success = probabilities.detach().argmax(dim=-1).ne(y)
                 with torch.no_grad():
                     replace = (success & ~best_success) | (success == best_success) & (
@@ -138,7 +165,6 @@ def input_pgd(
                     )
                 if step_index == attack_steps:
                     break
-                grad = torch.autograd.grad(losses.sum(), adv)[0]
                 with torch.no_grad():
                     adv = (adv.detach() + step_size * grad.sign()).clamp(0.0, 1.0)
                     adv = torch.max(torch.min(adv, x + epsilon), x - epsilon).clamp(0.0, 1.0)

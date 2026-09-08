@@ -37,6 +37,15 @@ def test_input_pgd_assesses_and_retains_the_final_update():
     assert torch.allclose(result.adversarial[:, 0, 0, 0], torch.full((4,), 0.65))
 
 
+def test_input_pgd_eot_uses_exact_sample_count_without_graph_accumulation():
+    model = ToyModel()
+    x = torch.full((2, 1, 2, 2), 0.75)
+    y = torch.zeros(2, dtype=torch.long)
+    result = input_pgd(model, x, y, 0.1, steps=1, restarts=1, eot_samples=4)
+    assert torch.isfinite(result.loss).all()
+    assert (result.adversarial - x).abs().max() <= 0.100001
+
+
 def test_input_pgd_can_carry_a_smaller_radius_candidate_forward():
     model = ToyModel()
     x = torch.full((2, 1, 2, 2), 0.75)
