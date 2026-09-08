@@ -85,6 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
     family_matrix.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     family_matrix.add_argument("--set", action="append", default=[])
     family_matrix.add_argument("--decision-record", required=True)
+    family_matrix.add_argument(
+        "--resume",
+        help="resume one explicitly selected strength/seed from its last checkpoint",
+    )
 
     for command in ("evaluate", "attack", "extract-latents", "analyze"):
         command_parser = subparsers.add_parser(command)
@@ -211,6 +215,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(
                 f"Phase 2 family {family} must vary {expected_parameter}, not {args.parameter}"
             )
+        if args.resume and (len(args.seeds) != 1 or len(args.values) != 1):
+            raise ValueError("--resume requires exactly one seed and one strength value")
         registered_values = {
             normalize_strength(family, value) for value in values_for_family(family)
         }
@@ -238,6 +244,8 @@ def main(argv: list[str] | None = None) -> int:
                     **config["model"],
                     args.parameter: yaml.safe_load(value),
                 }
+                if args.resume:
+                    config["resume"] = args.resume
                 existing = completed_run_for_config(config.get("output_dir", "outputs"), config)
                 paths.append(str(existing) if existing is not None else str(train_model(config)))
         print("\n".join(paths))

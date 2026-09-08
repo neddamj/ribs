@@ -31,6 +31,27 @@ def test_phase2_matrix_requires_and_records_decision_argument():
     assert args.decision_record.endswith("phase2_decision.example.yaml")
 
 
+def test_phase2_matrix_accepts_explicit_single_run_resume():
+    args = build_parser().parse_args(
+        [
+            "train-family-matrix",
+            "--config",
+            "configs/quantized.yaml",
+            "--parameter",
+            "bits",
+            "--values",
+            "6",
+            "--seeds",
+            "0",
+            "--resume",
+            "outputs/quantized/partial/checkpoints/last.pt",
+            "--decision-record",
+            "configs/phase2_decision.example.yaml",
+        ]
+    )
+    assert args.resume.endswith("checkpoints/last.pt")
+
+
 def test_phase2_matrix_has_fixed_strengths():
     import pandas as pd
 
