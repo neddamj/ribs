@@ -36,6 +36,7 @@ from .invariance import invariance_metrics
 from .metrics import shared_clean_correct, summarize_curve
 from .phase2 import (
     PHASE2_SPECS,
+    canonical_completed_runs,
     decision_record_hash,
     phase2_strength_columns,
     validate_decision_record,
@@ -377,22 +378,18 @@ def aggregate_completed_runs(
             )
         if allowed is None or family in allowed:
             completed_runs.append(path)
-    training_configs: dict[str, list[Path]] = {}
-    for run_dir in completed_runs:
-        config_path = run_dir / "resolved_config.yaml"
-        if config_path.exists():
-            comparable = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-            comparable.pop("resume", None)
-            if "phase2_decision_record" in comparable:
-                comparable["phase2_decision_record"].pop("path", None)
-            digest = hashlib.sha256(
-                json.dumps(comparable, sort_keys=True, default=str).encode()
-            ).hexdigest()
-            training_configs.setdefault(digest, []).append(run_dir)
-    duplicates = {key: value for key, value in training_configs.items() if len(value) > 1}
-    if duplicates:
-        names = [[str(path) for path in paths] for paths in duplicates.values()]
-        raise ValueError(f"Duplicate completed attempts require explicit resolution: {names}")
+    phase2_families = {"vib", "vq", "quantized", "autoencoder"}
+    if output_prefix == "phase2" and (allowed is None or allowed & phase2_families):
+        from .phase2 import canonical_completed_runs
+
+        families = tuple(sorted((allowed or phase2_families) & phase2_families))
+        canonical, _ = canonical_completed_runs(output_root, families)
+        canonical_set = {str(path) for path in canonical}
+        completed_runs = [
+            path
+            for path in completed_runs
+            if path.parent.name not in phase2_families or str(path) in canonical_set
+        ]
     manifest_hashes = {
         (run_dir / "data_manifest_hash.txt").read_text().strip()
         for run_dir in completed_runs
@@ -1333,6 +1330,12 @@ def validate_phase2_acceptance(output_root: str | Path = "outputs") -> dict[str,
                 validate_decision_record(decision_record)
             except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
                 errors.append(f"invalid Phase 2 decision record {decision_record}: {exc}")
+    canonical_runs, duplicate_groups = canonical_completed_runs(
+        output_root, ("vib", "vq", "quantized", "autoencoder")
+    )
+    canonical_set = {str(path) for path in canonical_runs}
+    if duplicate_groups and not list(output_root.glob("phase2_duplicate_provenance_*.json")):
+        errors.append("duplicate Phase 2 attempts lack a provenance audit")
     for run_dir in output_root.glob("*/*"):
         if not (run_dir / "COMPLETED").exists():
             continue
@@ -1342,6 +1345,11 @@ def validate_phase2_acceptance(output_root: str | Path = "outputs") -> dict[str,
         config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
         family = str(config.get("model", {}).get("family", "")).lower()
         if family not in {key[0] for key in expected}:
+            continue
+        if (
+            family in {"vib", "vq", "quantized", "autoencoder"}
+            and str(run_dir) not in canonical_set
+        ):
             continue
         parameter = PHASE2_SPECS[family][0]
         value = config.get("model", {}).get(parameter)
@@ -1354,8 +1362,6 @@ def validate_phase2_acceptance(output_root: str | Path = "outputs") -> dict[str,
         else:
             value = int(value)
         key = (family, value, int(config.get("seed", -1)))
-        if key in observed:
-            errors.append(f"duplicate completed Phase 2 run {key}")
         observed[key] = run_dir
     for key in sorted(expected, key=lambda item: (item[0], str(item[1]), item[2])):
         if key not in observed:

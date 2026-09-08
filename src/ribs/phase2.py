@@ -8,6 +8,7 @@ validation, and plotting code from silently drifting apart.
 from __future__ import annotations
 
 import copy
+import json
 import math
 from pathlib import Path
 from typing import Any
@@ -93,7 +94,13 @@ def _comparable(config: dict[str, Any]) -> str:
 
 
 def completed_run_for_config(output_root: str | Path, config: dict[str, Any]) -> Path | None:
-    """Find exactly one completed run with the same resolved configuration."""
+    """Find the canonical completed run with the same resolved configuration.
+
+    A recovery race can leave more than one valid completed attempt for one
+    registered training cell. They are not independent replications. Keep
+    all directories for provenance, but choose the most complete/latest
+    attempt deterministically so later matrix invocations are idempotent.
+    """
     target = _comparable(resolve_training_config(config))
     family = str(config["model"]["family"]).lower()
     matches = []
@@ -103,9 +110,77 @@ def completed_run_for_config(output_root: str | Path, config: dict[str, Any]) ->
         config_path = run_dir / "resolved_config.yaml"
         if config_path.exists() and _comparable(yaml.safe_load(config_path.read_text())) == target:
             matches.append(run_dir)
-    if len(matches) > 1:
-        raise ValueError(f"Multiple completed runs match configuration: {matches}")
-    return matches[0] if matches else None
+    return _canonical_run(matches) if matches else None
+
+
+def _run_completeness_score(run_dir: Path) -> tuple[int, float, str]:
+    """Rank duplicate attempts by saved postprocessing, then completion time."""
+    expected = (
+        run_dir / "history.parquet",
+        run_dir / "metrics.json",
+        run_dir / "artifacts" / "latents_final.safetensors",
+        run_dir / "artifacts" / "latents_development_tune.safetensors",
+    )
+    analysis = tuple((run_dir / "analysis").glob("*-attempt*/COMPLETED"))
+    evaluations = tuple((run_dir / "evaluations").glob("*-attempt*/COMPLETED"))
+    score = sum(path.exists() for path in expected) + len(analysis) + len(evaluations)
+    completed = run_dir / "COMPLETED"
+    mtime = completed.stat().st_mtime if completed.exists() else run_dir.stat().st_mtime
+    return score, mtime, str(run_dir)
+
+
+def _canonical_run(run_dirs: list[Path]) -> Path:
+    """Select one deterministic representative from duplicate attempts."""
+    return max(run_dirs, key=_run_completeness_score)
+
+
+def canonical_completed_runs(
+    output_root: str | Path,
+    families: tuple[str, ...] | list[str] | None = None,
+) -> tuple[list[Path], dict[str, list[Path]]]:
+    """Return canonical completed runs and duplicate-attempt groups."""
+    selected_families = tuple(families or PHASE2_FAMILIES)
+    groups: dict[str, list[Path]] = {}
+    for family in selected_families:
+        for run_dir in (Path(output_root) / family).glob("*"):
+            if not (run_dir / "COMPLETED").exists():
+                continue
+            config_path = run_dir / "resolved_config.yaml"
+            if not config_path.exists():
+                continue
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            groups.setdefault(_comparable(config), []).append(run_dir)
+    canonical = sorted(_canonical_run(paths) for paths in groups.values())
+    duplicates = {key: sorted(paths) for key, paths in groups.items() if len(paths) > 1}
+    return canonical, duplicates
+
+
+def write_duplicate_provenance(
+    output_root: str | Path,
+    audit_path: str | Path,
+    families: tuple[str, ...] | list[str] | None = None,
+) -> dict[str, Any]:
+    """Save the canonical/retry selection without modifying any run."""
+    canonical, duplicates = canonical_completed_runs(output_root, families)
+    payload = {
+        "selection_rule": (
+            "one canonical completed attempt per resolved configuration; maximize saved "
+            "postprocessing completeness, then latest COMPLETED mtime, then path"
+        ),
+        "canonical_runs": sorted(str(path) for path in canonical),
+        "duplicate_groups": [
+            {
+                "configuration_key": key,
+                "canonical": str(_canonical_run(paths)),
+                "preserved_retries": [str(path) for path in paths if path != _canonical_run(paths)],
+            }
+            for key, paths in sorted(duplicates.items())
+        ],
+    }
+    Path(audit_path).write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return payload
 
 
 def valid_identity_run(output_root: str | Path, seed: int, config: dict[str, Any]) -> Path | None:
@@ -223,7 +298,7 @@ def validate_decision_record(path: str | Path) -> dict[str, Any]:
             )
     budgets = record["final_attack_budgets"]
     if not isinstance(budgets, dict):
-        raise ValueError("Phase 2 final_attack_budgets must be a mapping")
+        raise TypeError("Phase 2 final_attack_budgets must be a mapping")
     input_budget = budgets.get("input_pgd", {})
     latent_budget = budgets.get("latent_pgd", {})
     expected_epsilons = [value / 255 for value in (0, 1, 2, 4, 8, 12, 16)]
