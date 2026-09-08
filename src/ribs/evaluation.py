@@ -1127,6 +1127,21 @@ def _candidate_collision_pairs(
     return pairs
 
 
+def _collision_batch_sizes(
+    attack_config: dict[str, Any], family: str | None = None
+) -> tuple[int, int]:
+    """Return effective attack and eligibility batches without changing pairs."""
+    collision_batch_size = int(attack_config.get("collision_batch_size", 8))
+    evaluation_batch_size = int(attack_config.get("evaluation_batch_size", 32))
+    if collision_batch_size < 1 or evaluation_batch_size < 1:
+        raise ValueError("collision_batch_size and evaluation_batch_size must be positive")
+    # The reconstruction graph for an autoencoder is much larger than the
+    # classifier-only graph used by the other collision families.  Processing
+    # one pair at a time preserves pair selection, attack budgets, and seeds.
+    effective_attack_batch_size = 1 if family == "autoencoder" else collision_batch_size
+    return effective_attack_batch_size, min(evaluation_batch_size, collision_batch_size)
+
+
 def select_collision_lambda(metrics: pd.DataFrame) -> dict[str, Any]:
     """Select a tuning candidate without consulting the final split."""
     required = {
@@ -1223,7 +1238,7 @@ def tune_collision_lambda(
                     scored.reference_source_preserved.astype(bool).mean()
                 ),
                 "median_distance": float(scored.distance.median()),
-                "num_records": int(len(scored)),
+                "num_records": len(scored),
                 "evaluation_dir": str(result_path.parent),
             }
         )
@@ -1311,6 +1326,7 @@ def evaluate_collision_attacks(
         "split": split,
         "max_pairs": max_pairs,
         "lambda_sem": lambda_sem,
+        "collision_batch_size": int(config["attack"].get("collision_batch_size", 8)),
         "attack": config["attack"],
         "checkpoint": checkpoint,
         "checkpoint_sha256": sha256_file(run_dir / "checkpoints" / checkpoint),
@@ -1328,9 +1344,17 @@ def evaluate_collision_attacks(
         model = _ReconstructionTask(model, reference).to(device).eval()
     model.eval()
     reference.eval()
-    eligibility_loader = make_loader(
-        config, split, batch_size=int(config["attack"].get("evaluation_batch_size", 32))
+    collision_batch_size, eligibility_batch_size = _collision_batch_sizes(
+        config["attack"], config["model"].get("family")
     )
+    evaluation_config["collision_attack_batch_size"] = collision_batch_size
+    evaluation_config["collision_eligibility_batch_size"] = eligibility_batch_size
+    # Eligibility is numerically batch-independent; use the attack batch cap to
+    # avoid materializing a larger autoencoder reconstruction graph.
+    eligibility_batch_size = min(
+        int(config["attack"].get("evaluation_batch_size", 32)), collision_batch_size
+    )
+    eligibility_loader = make_loader(config, split, batch_size=eligibility_batch_size)
     dataset = eligibility_loader.dataset
     sample_ids, labels, eligible = _eligibility_records(
         model, reference, eligibility_loader, device
@@ -1367,7 +1391,6 @@ def evaluate_collision_attacks(
     rows = []
     epsilons = sorted({0.0, *(float(value) for value in config["attack"]["input_epsilons"])})
     for epsilon in epsilons:
-        collision_batch_size = int(config["attack"].get("collision_batch_size", 8))
         for start in range(0, len(pairs), collision_batch_size):
             batch_pairs = pairs[start : start + collision_batch_size]
             source_indices = [pair[0] for pair in batch_pairs]

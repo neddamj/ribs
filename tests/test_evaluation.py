@@ -10,6 +10,7 @@ import yaml
 from ribs import evaluation
 from ribs.analysis import geometry_correlations
 from ribs.evaluation import (
+    _collision_batch_sizes,
     _ReconstructionTask,
     select_collision_lambda,
     validate_nearest_capacity_source,
@@ -122,6 +123,18 @@ def test_collision_lambda_selection_is_deterministic_and_prespecified():
     )
     selection = select_collision_lambda(metrics)
     assert selection["selected_lambda_sem"] == 1.0
+
+
+def test_collision_eligibility_uses_memory_safe_batch_cap():
+    assert _collision_batch_sizes({"evaluation_batch_size": 32, "collision_batch_size": 8}) == (
+        8,
+        8,
+    )
+    assert _collision_batch_sizes(
+        {"evaluation_batch_size": 32, "collision_batch_size": 8}, "autoencoder"
+    ) == (1, 8)
+    with pytest.raises(ValueError, match="must be positive"):
+        _collision_batch_sizes({"evaluation_batch_size": 0, "collision_batch_size": 8})
 
 
 def test_transfer_source_is_selected_by_nearest_same_seed_effective_rank(tmp_path):
