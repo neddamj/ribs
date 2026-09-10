@@ -1,0 +1,51 @@
+record_type: phase2_evaluation_recovery
+created_at: '2026-09-08T12:15:42-04:00'
+frozen_decision_record: configs/phase2_decision_20260902T120000.yaml
+frozen_decision_sha256: 90bf9e00139b5f32a0c8c367561af1f8e895ceadc9f5ecf6e9d0b297d6e0dba9
+affected_run: outputs/vq/vq-seed0-664584b28f3b-attempt0
+affected_configuration:
+  family: vq
+  codebook_size: 16
+  seed: 0
+  checkpoint: best_tune_accuracy.pt
+failed_attempt:
+  evaluation_dir: outputs/vq/vq-seed0-664584b28f3b-attempt0/evaluations/robustness-17d09e45d548-attempt0
+  log: outputs/phase2_tmux_logs/vq-seed0-664584b28f3b.log
+  failure: pre-quantization PGD retained-loss invariant
+  radius: 0.3
+  sample_id: imagenette2-320/val/n03028079/n03028079_9371.JPEG
+  clean_cross_entropy: 1.1274150609970093
+  selected_successful_candidate_cross_entropy: 1.0370651483535767
+  interpretation: >-
+    The frozen attack selection rule gives any misclassified candidate priority
+    over a correctly classified candidate. That selected candidate can have
+    lower CE than the clean point, so using the success-priority candidate loss
+    as the retention invariant was an implementation ambiguity, not evidence
+    of robustness.
+resolution:
+  primary_selection_unchanged: true
+  attack_budgets_unchanged: true
+  attack_surface_unchanged: true
+  added_result_field: retained_loss
+  retained_loss_definition: >-
+    Highest cross-entropy encountered over the clean point, carried candidate,
+    and all evaluated PGD trajectory points, tracked independently from the
+    success-priority selected candidate.
+  primary_candidate_loss_field_unchanged: true
+  source_files:
+    - src/ribs/attacks.py
+    - src/ribs/square_attack.py
+    - src/ribs/evaluation.py
+  regression_test: tests/test_attacks.py::test_success_priority_keeps_separate_highest_loss_retention
+retry:
+  evaluation_command: >-
+    CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m ribs.cli attack
+    --run-dir outputs/vq/vq-seed0-664584b28f3b-attempt0
+  session: ribs_vq_s0_k16_retry_20260908
+  log: outputs/phase2_tmux_logs/vq-seed0-664584b28f3b-retry.log
+  started_at: '2026-09-08T12:08:00-04:00'
+validation:
+  focused_pytest: '23 passed'
+  full_pytest: '62 passed, 1 warning'
+  ruff: passed
+  black: 'reported 4 files unchanged; process wrapper timed out during cleanup'
