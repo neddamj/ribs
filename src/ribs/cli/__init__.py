@@ -19,8 +19,10 @@ from ..analysis import (
 from ..config import apply_overrides, load_config
 from ..data import prepare_manifest
 from ..evaluation import (
+    evaluate_attack_diagnostics,
     evaluate_attacks,
     evaluate_autoencoder,
+    evaluate_autoencoder_attack_diagnostics,
     evaluate_autoencoder_attacks,
     evaluate_clean_run,
     evaluate_collision_attacks,
@@ -116,6 +118,14 @@ def build_parser() -> argparse.ArgumentParser:
     auto_attack.add_argument("--reference-run-dir", required=True)
     auto_attack.add_argument("--split", default="final")
     auto_attack.add_argument("--max-samples", type=int)
+
+    diagnostics = subparsers.add_parser("attack-diagnostics")
+    diagnostics.add_argument("--run-dir", required=True)
+    diagnostics.add_argument("--reference-run-dir")
+    diagnostics.add_argument("--split", default="final")
+    diagnostics.add_argument("--checkpoint")
+    diagnostics.add_argument("--diagnostic-samples", type=int)
+    diagnostics.add_argument("--diagnostic-tolerance", type=float)
 
     collision = subparsers.add_parser("collision-attack")
     collision.add_argument("--run-dir", required=True)
@@ -307,6 +317,32 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     run_dir = _run_dir(args)
+    if args.command == "attack-diagnostics":
+        import yaml
+
+        resolved = yaml.safe_load((run_dir / "resolved_config.yaml").read_text()) or {}
+        family = str(resolved.get("model", {}).get("family", "")).lower()
+        if family == "autoencoder":
+            if not args.reference_run_dir:
+                raise ValueError("--reference-run-dir is required for autoencoder diagnostics")
+            path = evaluate_autoencoder_attack_diagnostics(
+                run_dir,
+                args.reference_run_dir,
+                args.split,
+                args.checkpoint,
+                args.diagnostic_samples,
+                args.diagnostic_tolerance,
+            )
+        else:
+            path = evaluate_attack_diagnostics(
+                run_dir,
+                args.split,
+                args.checkpoint,
+                args.diagnostic_samples,
+                args.diagnostic_tolerance,
+            )
+        print(path)
+        return 0
     if args.command == "evaluate-autoencoder":
         print(evaluate_autoencoder(run_dir, args.reference_run_dir, args.split))
         return 0

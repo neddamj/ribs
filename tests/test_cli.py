@@ -52,6 +52,23 @@ def test_phase2_matrix_accepts_explicit_single_run_resume():
     assert args.resume.endswith("checkpoints/last.pt")
 
 
+def test_attack_diagnostics_accepts_independent_audit_overrides():
+    args = build_parser().parse_args(
+        [
+            "attack-diagnostics",
+            "--run-dir",
+            "outputs/vq/example",
+            "--diagnostic-samples",
+            "128",
+            "--diagnostic-tolerance",
+            "0.02",
+        ]
+    )
+    assert args.command == "attack-diagnostics"
+    assert args.diagnostic_samples == 128
+    assert args.diagnostic_tolerance == 0.02
+
+
 def test_phase2_matrix_has_fixed_strengths():
     import pandas as pd
 

@@ -523,14 +523,27 @@ def evaluate_attack_diagnostics(
     run_dir: str | Path,
     split: str = "final",
     checkpoint: str | None = None,
+    diagnostic_samples: int | None = None,
+    diagnostic_tolerance: float | None = None,
 ) -> Path:
-    """Run convergence checks for every attack surface on a shared subset."""
+    """Run convergence checks for every attack surface on a shared subset.
+
+    Optional overrides are reserved for an independent convergence audit. They
+    do not alter the frozen primary attack, and the resolved values are saved
+    in the audit artifact for provenance.
+    """
     run_dir = Path(run_dir)
     checkpoint = _resolve_checkpoint(run_dir, checkpoint)
     model, config, device = load_model(run_dir, checkpoint)
     loader = make_loader(config, split, batch_size=1)
     dataset = loader.dataset
-    sample_count = int(config["attack"].get("diagnostic_samples", 32))
+    sample_count = int(
+        diagnostic_samples
+        if diagnostic_samples is not None
+        else config["attack"].get("diagnostic_samples", 32)
+    )
+    if sample_count <= 0:
+        raise ValueError("diagnostic_samples must be positive")
     indices = _stratified_dataset_indices(dataset, sample_count)
     samples = [dataset[index] for index in indices]
     images = torch.stack([sample["image"] for sample in samples]).to(device)
@@ -540,7 +553,13 @@ def evaluate_attack_diagnostics(
     restarts = int(attack_cfg.get("restarts", 5))
     eot_samples = _sample_count(config)
     seed = int(attack_cfg.get("seed", 2025)) + 90_000_000
-    tolerance = float(attack_cfg.get("diagnostic_tolerance", 0.02))
+    tolerance = float(
+        diagnostic_tolerance
+        if diagnostic_tolerance is not None
+        else attack_cfg.get("diagnostic_tolerance", 0.02)
+    )
+    if tolerance < 0:
+        raise ValueError("diagnostic_tolerance must be non-negative")
     rows: list[dict[str, Any]] = []
     failures = []
 
@@ -588,6 +607,10 @@ def evaluate_attack_diagnostics(
             failures.append(
                 f"attack convergence failed for surface={surface} radius={radius}: {row}"
             )
+        if baseline.retained_loss is None or torch.any(
+            baseline.retained_loss + 1e-6 < baseline.initial_loss
+        ):
+            failures.append(f"retained loss decreased for surface={surface} radius={radius}")
 
     for epsilon in [float(value) for value in attack_cfg["input_epsilons"] if float(value) > 0]:
         baseline = input_pgd(model, images, labels, epsilon, steps, restarts, eot_samples, seed)
@@ -672,7 +695,9 @@ def evaluate_attack_diagnostics(
         "stronger_restarts": restarts * 2,
         "increased_eot_samples": eot_samples * 2 if family == "vib" else None,
         "eot_prediction_disagreement": disagreement,
+        "diagnostic_samples": sample_count,
         "tolerance": tolerance,
+        "independent_audit": diagnostic_samples is not None or diagnostic_tolerance is not None,
         "failures": failures,
     }
     evaluation_dir = _new_evaluation_dir(run_dir, "attack-diagnostics", report)
@@ -689,8 +714,14 @@ def evaluate_autoencoder_attack_diagnostics(
     reference_run_dir: str | Path,
     split: str = "final",
     checkpoint: str | None = None,
+    diagnostic_samples: int | None = None,
+    diagnostic_tolerance: float | None = None,
 ) -> Path:
-    """Run the same PGD correctness checks on the autoencoder task wrapper."""
+    """Run PGD correctness checks on the autoencoder task wrapper.
+
+    Optional overrides create a separately identified convergence audit and do
+    not change the frozen primary attack settings.
+    """
     run_dir = Path(run_dir)
     autoencoder, config, device = load_model(run_dir, checkpoint)
     reference, reference_config, reference_device = load_model(reference_run_dir)
@@ -699,7 +730,13 @@ def evaluate_autoencoder_attack_diagnostics(
     _validate_reference_config(config, reference_config, context="Autoencoder attack diagnostics")
     task = _ReconstructionTask(autoencoder, reference).to(device).eval()
     loader = make_loader(config, split, batch_size=1)
-    count = int(config["attack"].get("diagnostic_samples", 32))
+    count = int(
+        diagnostic_samples
+        if diagnostic_samples is not None
+        else config["attack"].get("diagnostic_samples", 32)
+    )
+    if count <= 0:
+        raise ValueError("diagnostic_samples must be positive")
     indices = _stratified_dataset_indices(loader.dataset, count)
     samples = [loader.dataset[index] for index in indices]
     images = torch.stack([sample["image"] for sample in samples]).to(device)
@@ -707,7 +744,13 @@ def evaluate_autoencoder_attack_diagnostics(
     attack_cfg = config["attack"]
     steps = int(attack_cfg.get("steps", 40))
     restarts = int(attack_cfg.get("restarts", 5))
-    tolerance = float(attack_cfg.get("diagnostic_tolerance", 0.02))
+    tolerance = float(
+        diagnostic_tolerance
+        if diagnostic_tolerance is not None
+        else attack_cfg.get("diagnostic_tolerance", 0.02)
+    )
+    if tolerance < 0:
+        raise ValueError("diagnostic_tolerance must be non-negative")
     seed = int(attack_cfg.get("seed", 2025)) + 91_000_000
     failures = []
     rows = []
@@ -733,7 +776,7 @@ def evaluate_autoencoder_attack_diagnostics(
         )
         if not passed:
             failures.append(f"stronger PGD raised robust accuracy at epsilon={epsilon}")
-        if torch.any(baseline.loss + 1e-6 < baseline.initial_loss):
+        if torch.any(baseline.retained_loss + 1e-6 < baseline.initial_loss):
             failures.append(f"retained loss decreased at epsilon={epsilon}")
         if torch.any((baseline.adversarial - images).abs().flatten(1).amax(1) > epsilon + 1e-6):
             failures.append(f"L-infinity bound failed at epsilon={epsilon}")
@@ -763,6 +806,8 @@ def evaluate_autoencoder_attack_diagnostics(
         )
         if not passed:
             failures.append(f"latent attack convergence failed at rho={rho}")
+        if torch.any(baseline.retained_loss + 1e-6 < baseline.initial_loss):
+            failures.append(f"retained loss decreased at rho={rho}")
         with torch.no_grad():
             clean_latent = task(images).canonical_latent.flatten(1)
         allowed = rho * clean_latent.norm(dim=1).clamp_min(1e-12)
@@ -776,7 +821,9 @@ def evaluate_autoencoder_attack_diagnostics(
         "sample_ids": [sample["sample_id"] for sample in samples],
         "rows": rows,
         "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
+        "diagnostic_samples": count,
         "tolerance": tolerance,
+        "independent_audit": diagnostic_samples is not None or diagnostic_tolerance is not None,
         "failures": failures,
     }
     evaluation_dir = _new_evaluation_dir(run_dir, "autoencoder-attack-diagnostics", report)
