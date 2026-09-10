@@ -17,6 +17,9 @@ class AttackResult:
     successful: Tensor
     initial_loss: Tensor
     restart: Tensor | None = None
+    # Highest CE encountered, retained independently of the success-priority
+    # candidate used for the attack prediction.
+    retained_loss: Tensor | None = None
 
 
 @contextmanager
@@ -109,13 +112,19 @@ def input_pgd(
         initial_restart = torch.full_like(y, -1, dtype=torch.long)
         if epsilon == 0.0:
             return AttackResult(
-                x, initial_loss.detach(), clean_pred.ne(y), initial_loss.detach(), initial_restart
+                x,
+                initial_loss.detach(),
+                clean_pred.ne(y),
+                initial_loss.detach(),
+                initial_restart,
+                initial_loss.detach(),
             )
         generator = torch.Generator(device=x.device).manual_seed(seed + 1)
         best_x = x.clone()
         best_loss = initial_loss.detach().clone()
         best_success = clean_pred.ne(y)
         best_restart = initial_restart
+        retained_loss = initial_loss.detach().clone()
         if initial_adversarial is not None:
             candidate = initial_adversarial.detach().float()
             if candidate.shape != x.shape:
@@ -126,6 +135,7 @@ def input_pgd(
                 candidate_loss, candidate_probabilities = _eot_loss(
                     model, candidate, y, eot_samples
                 )
+                retained_loss = torch.maximum(retained_loss, candidate_loss.detach())
                 candidate_success = candidate_probabilities.argmax(dim=-1).ne(y)
                 replace = (candidate_success & ~best_success) | (
                     candidate_success == best_success
@@ -154,6 +164,7 @@ def input_pgd(
                 losses, probabilities, grad = _eot_loss_with_gradient(model, adv, y, eot_samples)
                 success = probabilities.detach().argmax(dim=-1).ne(y)
                 with torch.no_grad():
+                    retained_loss = torch.maximum(retained_loss, losses.detach())
                     replace = (success & ~best_success) | (success == best_success) & (
                         losses > best_loss
                     )
@@ -168,13 +179,20 @@ def input_pgd(
                 with torch.no_grad():
                     adv = (adv.detach() + step_size * grad.sign()).clamp(0.0, 1.0)
                     adv = torch.max(torch.min(adv, x + epsilon), x - epsilon).clamp(0.0, 1.0)
-        if torch.any(best_loss + 1e-6 < initial_loss):
-            raise RuntimeError("PGD retained loss is below its clean initial loss")
+        if torch.any(retained_loss + 1e-6 < initial_loss):
+            raise RuntimeError("PGD highest retained loss is below its clean initial loss")
         if (best_x - x).abs().flatten(1).amax(1).max() > epsilon + 1e-6:
             raise RuntimeError("PGD produced an example outside the L-infinity constraint")
         if best_x.min() < -1e-6 or best_x.max() > 1.0 + 1e-6:
             raise RuntimeError("PGD produced pixels outside [0, 1]")
-        return AttackResult(best_x, best_loss, best_success, initial_loss.detach(), best_restart)
+        return AttackResult(
+            best_x,
+            best_loss,
+            best_success,
+            initial_loss.detach(),
+            best_restart,
+            retained_loss,
+        )
 
 
 def project_l2(delta: Tensor, radius: Tensor) -> Tensor:
@@ -225,6 +243,7 @@ def latent_pgd(
     best_success = clean_pred.ne(y)
     step = 2.0 * radius / max(1, steps)
     best_restart = torch.full_like(y, -1, dtype=torch.long)
+    retained_loss = initial_loss.clone()
     if initial_adversarial is not None:
         candidate = initial_adversarial.detach()
         if candidate.shape != z.shape:
@@ -234,6 +253,7 @@ def latent_pgd(
         with torch.no_grad():
             candidate_logits = model.classify_latent(candidate)
             candidate_loss = F.cross_entropy(candidate_logits.float(), y, reduction="none")
+            retained_loss = torch.maximum(retained_loss, candidate_loss)
             candidate_success = candidate_logits.argmax(dim=-1).ne(y)
             replace = (candidate_success & ~best_success) | (candidate_success == best_success) & (
                 candidate_loss > best_loss
@@ -257,6 +277,7 @@ def latent_pgd(
             losses = F.cross_entropy(logits.float(), y, reduction="none")
             success = logits.detach().argmax(dim=-1).ne(y)
             with torch.no_grad():
+                retained_loss = torch.maximum(retained_loss, losses.detach())
                 replace = (success & ~best_success) | (success == best_success) & (
                     losses > best_loss
                 )
@@ -275,9 +296,9 @@ def latent_pgd(
             with torch.no_grad():
                 adv = adv.detach() + direction * step.view(-1, *([1] * (adv.ndim - 1)))
                 adv = z + project_l2(adv - z, radius)
-    if torch.any(best_loss + 1e-6 < initial_loss):
-        raise RuntimeError("Latent PGD retained loss is below its clean initial loss")
-    return AttackResult(best_z, best_loss, best_success, initial_loss, best_restart)
+    if torch.any(retained_loss + 1e-6 < initial_loss):
+        raise RuntimeError("Latent PGD highest retained loss is below its clean initial loss")
+    return AttackResult(best_z, best_loss, best_success, initial_loss, best_restart, retained_loss)
 
 
 def prequantization_latent_pgd(
@@ -312,6 +333,7 @@ def prequantization_latent_pgd(
     best_success = clean_pred.ne(y)
     step = 2.0 * radius / max(1, steps)
     best_restart = torch.full_like(y, -1, dtype=torch.long)
+    retained_loss = initial_loss.clone()
     if initial_adversarial is not None:
         candidate = initial_adversarial.detach().flatten(1)
         if candidate.shape != pre.shape:
@@ -321,6 +343,7 @@ def prequantization_latent_pgd(
         with torch.no_grad():
             candidate_logits = model.classify_pre_bottleneck(candidate)
             candidate_loss = F.cross_entropy(candidate_logits.float(), y, reduction="none")
+            retained_loss = torch.maximum(retained_loss, candidate_loss)
             candidate_success = candidate_logits.argmax(dim=-1).ne(y)
             replace = (candidate_success & ~best_success) | (candidate_success == best_success) & (
                 candidate_loss > best_loss
@@ -344,6 +367,7 @@ def prequantization_latent_pgd(
             losses = F.cross_entropy(logits.float(), y, reduction="none")
             success = logits.detach().argmax(dim=-1).ne(y)
             with torch.no_grad():
+                retained_loss = torch.maximum(retained_loss, losses.detach())
                 replace = (success & ~best_success) | (success == best_success) & (
                     losses > best_loss
                 )
@@ -360,6 +384,8 @@ def prequantization_latent_pgd(
             with torch.no_grad():
                 adv = adv.detach() + direction * step.view(-1, 1)
                 adv = pre + project_l2(adv - pre, radius)
-    if torch.any(best_loss + 1e-6 < initial_loss):
-        raise RuntimeError("Pre-quantization PGD retained loss is below its initial loss")
-    return AttackResult(best, best_loss, best_success, initial_loss, best_restart)
+    if torch.any(retained_loss + 1e-6 < initial_loss):
+        raise RuntimeError(
+            "Pre-quantization PGD highest retained loss is below its clean initial loss"
+        )
+    return AttackResult(best, best_loss, best_success, initial_loss, best_restart, retained_loss)

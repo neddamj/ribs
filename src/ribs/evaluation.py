@@ -355,6 +355,7 @@ def evaluate_attacks(
                         "adversarial_prediction": int(adv_pred[index]),
                         "successful": bool(adv_pred[index] != labels[index]),
                         "loss": float(result.loss[index]),
+                        "retained_loss": float(result.retained_loss[index]),
                         "initial_loss": float(result.initial_loss[index]),
                         "linf_norm": float(perturbation_norm[index]),
                         "best_restart": (
@@ -391,6 +392,7 @@ def evaluate_attacks(
             if rho == 0.0:
                 adversarial_latent = clean_attack_latent
                 result_loss = latent_clean_loss
+                result_retained_loss = latent_clean_loss
                 result_initial_loss = latent_clean_loss
                 adv_pred = latent_clean_predictions
             else:
@@ -407,6 +409,7 @@ def evaluate_attacks(
                 previous_latent_candidate = result.adversarial.detach()
                 adversarial_latent = result.adversarial
                 result_loss = result.loss
+                result_retained_loss = result.retained_loss
                 result_initial_loss = result.initial_loss
                 with torch.no_grad():
                     adv_logits = (
@@ -430,6 +433,7 @@ def evaluate_attacks(
                         "adversarial_prediction": int(adv_pred[index]),
                         "successful": bool(adv_pred[index] != labels[index]),
                         "loss": float(result_loss[index]),
+                        "retained_loss": float(result_retained_loss[index]),
                         "initial_loss": float(result_initial_loss[index]),
                         "attack_surface": surface,
                         "l2_norm": float(latent_delta_norm[index]),
@@ -471,6 +475,7 @@ def evaluate_attacks(
                             "adversarial_prediction": int(diagnostic_pred[index]),
                             "successful": bool(diagnostic_pred[index] != labels[index]),
                             "loss": float(diagnostic.loss[index]),
+                            "retained_loss": float(diagnostic.retained_loss[index]),
                             "initial_loss": float(diagnostic.initial_loss[index]),
                             "attack_surface": "post_bottleneck_ambient",
                             "l2_norm": float(
@@ -968,6 +973,7 @@ def evaluate_autoencoder_attacks(
                     "adversarial_prediction": int(adversarial_prediction[index]),
                     "successful": bool(adversarial_prediction[index] != labels[index]),
                     "loss": float(result.loss[index]),
+                    "retained_loss": float(result.retained_loss[index]),
                     "initial_loss": float(result.initial_loss[index]),
                     "linf_norm": float((result.adversarial[index] - images[index]).abs().max()),
                     "best_restart": (
@@ -992,6 +998,7 @@ def evaluate_autoencoder_attacks(
                 adversarial_latent = clean_latent
                 adversarial_prediction = latent_clean_prediction
                 result_loss = latent_clean_loss
+                result_retained_loss = latent_clean_loss
                 result_initial_loss = latent_clean_loss
             else:
                 result = latent_pgd(
@@ -1007,6 +1014,7 @@ def evaluate_autoencoder_attacks(
                 previous_latent_candidate = result.adversarial.detach()
                 adversarial_latent = result.adversarial
                 result_loss = result.loss
+                result_retained_loss = result.retained_loss
                 result_initial_loss = result.initial_loss
                 with torch.no_grad():
                     adversarial_prediction = task.classify_latent(adversarial_latent).argmax(-1)
@@ -1020,6 +1028,7 @@ def evaluate_autoencoder_attacks(
                     "adversarial_prediction": int(adversarial_prediction[index]),
                     "successful": bool(adversarial_prediction[index] != labels[index]),
                     "loss": float(result_loss[index]),
+                    "retained_loss": float(result_retained_loss[index]),
                     "initial_loss": float(result_initial_loss[index]),
                     "attack_surface": "canonical_latent",
                     "l2_norm": float(
@@ -1584,6 +1593,7 @@ def evaluate_square_attack(
                         "adversarial_prediction": int(adversarial_logits[index].argmax()),
                         "successful": bool(adversarial_logits[index].argmax() != labels[index]),
                         "loss": float(result.loss[index]),
+                        "retained_loss": float(result.retained_loss[index]),
                         "initial_loss": float(result.initial_loss[index]),
                         "queries": int(config["attack"].get("square_queries", 5000)),
                         "attack_seed": radius_seed,

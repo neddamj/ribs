@@ -3,7 +3,13 @@ from types import SimpleNamespace
 
 import torch
 
-from ribs.attacks import _uniform_l2_noise, input_pgd, latent_pgd, project_l2
+from ribs.attacks import (
+    _uniform_l2_noise,
+    input_pgd,
+    latent_pgd,
+    prequantization_latent_pgd,
+    project_l2,
+)
 from ribs.square_attack import square_attack
 
 
@@ -88,6 +94,41 @@ def test_latent_pgd_returns_latent_shape():
     y = torch.zeros(2, dtype=torch.long)
     result = latent_pgd(model, x, y, 0.1, steps=2, restarts=1)
     assert result.adversarial.shape == (2, 4)
+
+
+def test_success_priority_keeps_separate_highest_loss_retention():
+    class ToyPreQuantModel(torch.nn.Module):
+        def forward(self, x, sample=False):
+            pre = x.flatten(1)
+            return SimpleNamespace(
+                logits=self.classify_pre_bottleneck(pre),
+                latent=pre,
+                canonical_latent=pre,
+                pre_bottleneck=pre,
+            )
+
+        def classify_pre_bottleneck(self, pre):
+            delta = pre[:, :1] - 1.0
+            logits = torch.full((len(pre), 10), -2.0, device=pre.device)
+            logits[:, 0] = 0.1 + 2.0 * delta[:, 0]
+            logits[:, 1] = 0.01 + 3.0 * delta[:, 0]
+            return logits
+
+    model = ToyPreQuantModel().eval()
+    x = torch.ones(1, 1, 1, 1)
+    y = torch.zeros(1, dtype=torch.long)
+    result = prequantization_latent_pgd(
+        model,
+        x,
+        y,
+        0.2,
+        steps=1,
+        restarts=0,
+        initial_adversarial=torch.tensor([[1.1]]),
+    )
+    assert result.successful.item()
+    assert result.loss.item() < result.initial_loss.item()
+    assert torch.all(result.retained_loss >= result.initial_loss - 1e-6)
 
 
 def test_square_attack_respects_bound(monkeypatch):

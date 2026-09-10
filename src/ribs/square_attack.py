@@ -34,8 +34,11 @@ def square_attack(
     best_x = x.detach().clone()
     best_loss = initial_loss.clone()
     best_success = initial_logits.argmax(-1).ne(y)
+    retained_loss = initial_loss.clone()
     if epsilon == 0 or queries <= 0:
-        return AttackResult(best_x, best_loss, best_success, initial_loss)
+        return AttackResult(
+            best_x, best_loss, best_success, initial_loss, retained_loss=retained_loss
+        )
     try:
         import torchattacks
     except ImportError as exc:
@@ -63,9 +66,16 @@ def square_attack(
         raise RuntimeError("Square Attack returned pixels outside [0, 1]")
     logits = model(candidate, sample=False).logits
     losses = F.cross_entropy(logits.float(), y, reduction="none")
+    retained_loss = torch.maximum(retained_loss, losses)
     success = logits.argmax(-1).ne(y)
     replace = (success & ~best_success) | (success == best_success) & (losses > best_loss)
     best_x = torch.where(replace.view(-1, *([1] * (x.ndim - 1))), candidate, best_x)
     best_loss = torch.where(replace, losses, best_loss)
     best_success = torch.where(replace, success, best_success)
-    return AttackResult(best_x, best_loss, best_success, initial_loss)
+    return AttackResult(
+        best_x,
+        best_loss,
+        best_success,
+        initial_loss,
+        retained_loss=retained_loss,
+    )
