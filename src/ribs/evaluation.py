@@ -39,6 +39,50 @@ def _new_evaluation_dir(run_dir: Path, name: str, evaluation_config: dict[str, A
             attempt += 1
 
 
+def _matching_evaluation_config(path: Path, expected: dict[str, Any]) -> bool:
+    """Return whether an evaluation directory has the requested immutable identity."""
+    config_path = path / "config.json"
+    if not config_path.exists():
+        return False
+    try:
+        observed = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return all(observed.get(key) == value for key, value in expected.items())
+
+
+def _resumable_evaluation_dir(
+    run_dir: Path, name: str, evaluation_config: dict[str, Any], result_name: str
+) -> tuple[Path, bool]:
+    """Reuse one exact completed/incomplete evaluation, or create a new attempt.
+
+    Completed artifacts remain immutable. An incomplete directory is resumed only
+    when its saved identity contains every requested configuration field. Multiple
+    matching attempts are rejected rather than selected heuristically.
+    """
+    base_name = f"{name}-{config_hash(evaluation_config)}"
+    matches = sorted(
+        path
+        for path in (run_dir / "evaluations").glob(f"{base_name}-attempt*")
+        if _matching_evaluation_config(path, evaluation_config)
+    )
+    completed = [
+        path for path in matches if (path / "COMPLETED").exists() and (path / result_name).exists()
+    ]
+    if len(completed) > 1:
+        raise ValueError(f"Multiple completed evaluations match {name}: {completed}")
+    if completed:
+        return completed[0], True
+    incomplete = [path for path in matches if not (path / "COMPLETED").exists()]
+    if len(incomplete) > 1:
+        raise ValueError(f"Multiple incomplete evaluations match {name}: {incomplete}")
+    if incomplete:
+        return incomplete[0], False
+    path = _new_evaluation_dir(run_dir, name, evaluation_config)
+    write_json(path / "config.json", {**evaluation_config, "environment": environment_info()})
+    return path, False
+
+
 def _resolve_checkpoint(run_dir: Path, checkpoint: str | None) -> str:
     return checkpoint or (
         "best_tune_mse.pt"
@@ -1182,7 +1226,7 @@ def _eligibility_records(
     sample_ids: list[str] = []
     labels, eligible = [], []
     for batch in loader:
-        images = batch["image"].to(device)
+        images = batch["image"].to(device, non_blocking=True)
         current_labels = torch.as_tensor(batch["label"], device=device)
         model_prediction = model(images, sample=False).logits.argmax(1)
         reference_prediction = reference(images, sample=False).logits.argmax(1)
@@ -1230,7 +1274,17 @@ def _collision_batch_sizes(
     # classifier-only graph used by the other collision families.  Processing
     # one pair at a time preserves pair selection, attack budgets, and seeds.
     effective_attack_batch_size = 1 if family == "autoencoder" else collision_batch_size
-    return effective_attack_batch_size, min(evaluation_batch_size, collision_batch_size)
+    # Eligibility runs under no_grad and does not retain the reconstruction graph,
+    # so it can use the ordinary evaluation batch independently of attack memory.
+    return effective_attack_batch_size, evaluation_batch_size
+
+
+def _cache_collision_images(
+    dataset: ImagenetteDataset, pairs: list[tuple[int, int]]
+) -> dict[int, torch.Tensor]:
+    """Decode each deterministic evaluation image used by collision pairs once."""
+    selected_indices = sorted({index for pair in pairs for index in pair})
+    return {index: dataset[index]["image"] for index in selected_indices}
 
 
 def select_collision_lambda(metrics: pd.DataFrame) -> dict[str, Any]:
@@ -1307,8 +1361,11 @@ def tune_collision_lambda(
         ),
         "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
     }
-    tuning_dir = _new_evaluation_dir(run_dir, "collision-tuning", tuning_config)
-    write_json(tuning_dir / "config.json", {**tuning_config, "environment": environment_info()})
+    tuning_dir, tuning_complete = _resumable_evaluation_dir(
+        run_dir, "collision-tuning", tuning_config, "selection.json"
+    )
+    if tuning_complete:
+        return tuning_dir / "selection.json"
     rows = []
     for candidate in candidates:
         result_path = evaluate_collision_attacks(
@@ -1430,9 +1487,13 @@ def evaluate_collision_attacks(
         "tuning_artifact_sha256": (sha256_file(tuning_path) if tuning_path is not None else None),
         "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
     }
-    evaluation_dir = _new_evaluation_dir(run_dir, "collision", evaluation_config)
+    evaluation_dir, evaluation_complete = _resumable_evaluation_dir(
+        run_dir, "collision", evaluation_config, "collision_attacks.parquet"
+    )
+    if evaluation_complete:
+        return evaluation_dir / "collision_attacks.parquet"
     if config["model"].get("family") == "autoencoder":
-        model = _ReconstructionTask(model, reference).to(device).eval()
+        model = _ReconstructionTask(model, reference).to(device).eval().requires_grad_(False)
     model.eval()
     reference.eval()
     collision_batch_size, eligibility_batch_size = _collision_batch_sizes(
@@ -1440,11 +1501,6 @@ def evaluate_collision_attacks(
     )
     evaluation_config["collision_attack_batch_size"] = collision_batch_size
     evaluation_config["collision_eligibility_batch_size"] = eligibility_batch_size
-    # Eligibility is numerically batch-independent; use the attack batch cap to
-    # avoid materializing a larger autoencoder reconstruction graph.
-    eligibility_batch_size = min(
-        int(config["attack"].get("evaluation_batch_size", 32)), collision_batch_size
-    )
     eligibility_loader = make_loader(config, split, batch_size=eligibility_batch_size)
     dataset = eligibility_loader.dataset
     sample_ids, labels, eligible = _eligibility_records(
@@ -1467,6 +1523,7 @@ def evaluate_collision_attacks(
     reference_distances, _ = nearest_opposing(
         tune["canonical_latent"], torch.tensor(tune_index.label.to_numpy())
     )
+    sorted_reference_distances = torch.sort(reference_distances).values
     pair_frame = pd.DataFrame(
         [
             {
@@ -1479,20 +1536,46 @@ def evaluate_collision_attacks(
         ]
     )
     save_frame(pair_frame, evaluation_dir / "collision_pair_manifest.parquet")
-    rows = []
+    # Evaluation transforms are deterministic. Cache only images participating
+    # in selected pairs so every radius reuses exactly the same tensor instead
+    # of repeatedly decoding the image from disk.
+    image_cache = _cache_collision_images(dataset, pairs)
+    shard_dir = evaluation_dir / "shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    shard_frames = []
     epsilons = sorted({0.0, *(float(value) for value in config["attack"]["input_epsilons"])})
-    for epsilon in epsilons:
+    for epsilon_index, epsilon in enumerate(epsilons):
         for start in range(0, len(pairs), collision_batch_size):
             batch_pairs = pairs[start : start + collision_batch_size]
+            attack_seed = (
+                int(config["attack"].get("seed", 2025)) + round(epsilon * 255) * 100_000 + start
+            )
+            shard_path = shard_dir / f"epsilon-{epsilon_index:02d}-batch-{start:06d}.parquet"
+            if shard_path.exists():
+                shard = pd.read_parquet(shard_path)
+                expected_sources = [sample_ids[pair[0]] for pair in batch_pairs]
+                expected_targets = [sample_ids[pair[1]] for pair in batch_pairs]
+                valid = (
+                    len(shard) == len(batch_pairs)
+                    and shard.source_sample_id.astype(str).tolist() == expected_sources
+                    and shard.target_sample_id.astype(str).tolist() == expected_targets
+                    and set(shard.epsilon.astype(float)) == {epsilon}
+                    and set(shard.attack_seed.astype(int)) == {attack_seed}
+                    and set(shard.attack_protocol_version.astype(int)) == {ATTACK_PROTOCOL_VERSION}
+                )
+                if not valid:
+                    raise ValueError(f"Collision resume shard does not match: {shard_path}")
+                shard_frames.append(shard)
+                continue
             source_indices = [pair[0] for pair in batch_pairs]
             target_indices = [pair[1] for pair in batch_pairs]
-            source_images = torch.stack([dataset[index]["image"] for index in source_indices]).to(
-                device
+            source_images = torch.stack([image_cache[index] for index in source_indices]).to(
+                device, non_blocking=True
             )
-            target_images = torch.stack([dataset[index]["image"] for index in target_indices]).to(
-                device
+            target_images = torch.stack([image_cache[index] for index in target_indices]).to(
+                device, non_blocking=True
             )
-            source_labels = labels[source_indices].to(device)
+            source_labels = labels[source_indices].to(device, non_blocking=True)
             result = targeted_collision_attack(
                 model,
                 reference,
@@ -1504,9 +1587,7 @@ def evaluate_collision_attacks(
                 int(config["attack"].get("collision_steps", 200)),
                 int(config["attack"].get("collision_restarts", 5)),
                 lambda_sem,
-                seed=int(config["attack"].get("seed", 2025))
-                + round(epsilon * 255) * 100_000
-                + start,
+                seed=attack_seed,
             )
             with torch.no_grad():
                 final_output = model(result["adversarial"], sample=False)
@@ -1519,6 +1600,34 @@ def evaluate_collision_attacks(
                 ).norm(2, dim=1)
                 source_prediction = reference(result["adversarial"]).logits.argmax(1)
                 target_class_prediction = final_output.logits.argmax(1)
+                linf_norm = (result["adversarial"] - source_images).abs().flatten(1).amax(1)
+            distances_cpu = distances.detach().cpu()
+            distance_percentiles = (
+                torch.searchsorted(
+                    sorted_reference_distances,
+                    distances_cpu.double(),
+                    right=True,
+                ).double()
+                / len(reference_distances)
+                * 100.0
+            )
+            source_prediction_cpu = source_prediction.cpu()
+            target_prediction_cpu = target_class_prediction.cpu()
+            success_cpu = result["successful"].cpu()
+            linf_cpu = linf_norm.cpu()
+            final_codes = final_output.metadata.get("code_indices")
+            target_codes = target_output.metadata.get("code_indices")
+            if final_codes is not None and target_codes is not None:
+                code_equal = (final_codes == target_codes).flatten(1).cpu()
+            else:
+                code_equal = None
+            final_quantized = final_output.metadata.get("quantized_latent")
+            target_quantized = target_output.metadata.get("quantized_latent")
+            if final_quantized is not None and target_quantized is not None:
+                quantized_equal = (final_quantized == target_quantized).flatten(1).cpu()
+            else:
+                quantized_equal = None
+            batch_rows = []
             for local, (source_index, target_index) in enumerate(batch_pairs):
                 row = {
                     "source_sample_id": sample_ids[source_index],
@@ -1845,19 +1954,25 @@ def evaluate_transfer_attack(
             previous_source_candidate = result.adversarial.detach()
             with torch.no_grad():
                 target_adversarial = target(result.adversarial, sample=False).logits.argmax(1)
+                linf_norm = (result.adversarial - images).abs().flatten(1).amax(1)
+            labels_cpu = labels.cpu()
+            target_clean_cpu = target_clean.cpu()
+            target_adversarial_cpu = target_adversarial.cpu()
+            linf_cpu = linf_norm.cpu()
+            restart_cpu = result.restart.cpu() if result.restart is not None else None
             for local, sample in enumerate(samples):
                 rows.append(
                     {
                         "sample_id": sample["sample_id"],
-                        "label": int(labels[local]),
+                        "label": int(labels_cpu[local]),
                         "radius": epsilon,
-                        "clean_prediction": int(target_clean[local]),
-                        "clean_correct": bool(target_clean[local] == labels[local]),
-                        "adversarial_prediction": int(target_adversarial[local]),
-                        "successful": bool(target_adversarial[local] != labels[local]),
-                        "linf_norm": float((result.adversarial[local] - images[local]).abs().max()),
+                        "clean_prediction": int(target_clean_cpu[local]),
+                        "clean_correct": bool(target_clean_cpu[local] == labels_cpu[local]),
+                        "adversarial_prediction": int(target_adversarial_cpu[local]),
+                        "successful": bool(target_adversarial_cpu[local] != labels_cpu[local]),
+                        "linf_norm": float(linf_cpu[local]),
                         "best_restart": (
-                            int(result.restart[local]) if result.restart is not None else -1
+                            int(restart_cpu[local]) if restart_cpu is not None else -1
                         ),
                         "attack_seed": radius_seed,
                         "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
