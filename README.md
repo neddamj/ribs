@@ -93,6 +93,20 @@ queued safely with `scripts/run_phase2_parallel.sh`; set `GPU_COUNT` when a
 different number of idle GPUs is available. Each queued job retains all three
 seeds and writes a separate log.
 
+Long Phase 2 evaluations can be resumed and dynamically distributed by run:
+
+```bash
+GPU_COUNT=4 PYTHON_BIN=.venv/bin/python \
+  ./scripts/run_phase2_postprocess_parallel.sh \
+  configs configs/phase2_decision_YYYYMMDDTHHMMSS.yaml
+```
+
+Collision evaluations checkpoint immutable shards for each epsilon and pair
+batch. Re-running the same configuration validates and reuses those shards.
+The postprocessing drivers continue past independent failures, save timestamped
+JSON/CSV stage reports under `outputs/`, and still return a nonzero status when
+any stage fails or final validation is not ready.
+
 `run_phase2.sh` performs the four family sweeps and then evaluates, aggregates,
 plots, and validates completed runs. It stops on a failed command so failures
 can be recorded and the matrix safely resumed.
