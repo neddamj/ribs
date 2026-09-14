@@ -112,6 +112,25 @@ def test_attack_evaluation_sets_eval_mode_before_clean_prediction(tmp_path, monk
     assert loader_arguments["batch_size"] == 2
 
 
+def test_load_model_freezes_parameters_without_disabling_input_gradients(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "run" / "checkpoints" / "best_tune_accuracy.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"fixture")
+    model = torch.nn.Linear(2, 2, bias=False)
+    state = {"config": {"device": "cpu"}, "model": model.state_dict()}
+    monkeypatch.setattr(evaluation.torch, "load", lambda *args, **kwargs: state)
+    monkeypatch.setattr(
+        evaluation, "create_model", lambda config: torch.nn.Linear(2, 2, bias=False)
+    )
+    monkeypatch.setattr(evaluation, "choose_device", lambda config: torch.device("cpu"))
+
+    loaded, _, _ = evaluation.load_model(checkpoint.parent.parent)
+    assert not any(parameter.requires_grad for parameter in loaded.parameters())
+    inputs = torch.ones(1, 2, requires_grad=True)
+    loaded(inputs).sum().backward()
+    assert inputs.grad is not None
+
+
 def test_collision_lambda_selection_is_deterministic_and_prespecified():
     metrics = pd.DataFrame(
         {

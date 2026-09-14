@@ -66,7 +66,10 @@ def load_model(run_dir: str | Path, checkpoint: str | None = None):
     model = create_model(config)
     model.load_state_dict(state["model"])
     device = choose_device(config)
-    return model.to(device).eval(), config, device
+    # Evaluation only differentiates with respect to inputs/latents. Freezing
+    # parameters preserves those gradients while avoiding parameter-gradient work.
+    model = model.to(device).eval().requires_grad_(False)
+    return model, config, device
 
 
 def make_loader(config: dict[str, Any], split: str, batch_size: int | None = None) -> DataLoader:
@@ -82,12 +85,14 @@ def make_loader(config: dict[str, Any], split: str, batch_size: int | None = Non
     def worker_init(worker_id: int) -> None:
         seed_everything(int(config.get("seed", 0)) + 3000 + worker_id, deterministic=False)
 
+    num_workers = int(data.get("num_workers", 0))
     return DataLoader(
         dataset,
         batch_size=batch_size or int(config["train"].get("batch_size", 128)),
         shuffle=False,
-        num_workers=int(data.get("num_workers", 0)),
+        num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
         worker_init_fn=worker_init,
     )
 
@@ -145,7 +150,7 @@ def evaluate_clean_run(
             if max_samples is None
             else min(len(batch["label"]), max_samples - seen)
         )
-        images = batch["image"][:take].to(device)
+        images = batch["image"][:take].to(device, non_blocking=True)
         labels = torch.as_tensor(batch["label"][:take], device=device)
         deterministic_logits = model(images, sample=False).logits
         logits = _predict_logits(
@@ -312,7 +317,7 @@ def evaluate_attacks(
             if max_samples is None
             else min(len(batch["label"]), max_samples - seen)
         )
-        images = batch["image"][:take].to(device)
+        images = batch["image"][:take].to(device, non_blocking=True)
         labels = torch.as_tensor(batch["label"][:take], device=device)
         sample_ids = batch["sample_id"][:take]
         batch_seed = attack_seed + batch_number * 1_000_000
@@ -344,22 +349,30 @@ def evaluate_attacks(
                     ).argmax(dim=-1)
                 )
                 perturbation_norm = (result.adversarial - images).abs().flatten(1).amax(dim=1)
+            labels_cpu = labels.cpu()
+            clean_predictions_cpu = clean_predictions.cpu()
+            adv_pred_cpu = adv_pred.cpu()
+            perturbation_cpu = perturbation_norm.cpu()
+            result_loss_cpu = result.loss.cpu()
+            retained_loss_cpu = result.retained_loss.cpu()
+            initial_loss_cpu = result.initial_loss.cpu()
+            restart_cpu = result.restart.cpu() if result.restart is not None else None
             for index, sample_id in enumerate(sample_ids):
                 input_rows.append(
                     {
                         "sample_id": sample_id,
-                        "label": int(labels[index]),
+                        "label": int(labels_cpu[index]),
                         "radius": epsilon,
-                        "clean_prediction": int(clean_predictions[index]),
-                        "clean_correct": bool(clean_predictions[index] == labels[index]),
-                        "adversarial_prediction": int(adv_pred[index]),
-                        "successful": bool(adv_pred[index] != labels[index]),
-                        "loss": float(result.loss[index]),
-                        "retained_loss": float(result.retained_loss[index]),
-                        "initial_loss": float(result.initial_loss[index]),
-                        "linf_norm": float(perturbation_norm[index]),
+                        "clean_prediction": int(clean_predictions_cpu[index]),
+                        "clean_correct": bool(clean_predictions_cpu[index] == labels_cpu[index]),
+                        "adversarial_prediction": int(adv_pred_cpu[index]),
+                        "successful": bool(adv_pred_cpu[index] != labels_cpu[index]),
+                        "loss": float(result_loss_cpu[index]),
+                        "retained_loss": float(retained_loss_cpu[index]),
+                        "initial_loss": float(initial_loss_cpu[index]),
+                        "linf_norm": float(perturbation_cpu[index]),
                         "best_restart": (
-                            int(result.restart[index]) if result.restart is not None else -1
+                            int(restart_cpu[index]) if restart_cpu is not None else -1
                         ),
                         "attack_seed": radius_seed,
                         "checkpoint": checkpoint,
@@ -420,31 +433,38 @@ def evaluate_attacks(
                     adv_pred = adv_logits.argmax(dim=-1)
             latent_delta_norm = (adversarial_latent - clean_attack_latent).flatten(1).norm(dim=1)
             latent_base_norm = clean_attack_latent.flatten(1).norm(dim=1).clamp_min(1e-12)
+            labels_cpu = labels.cpu()
+            latent_clean_predictions_cpu = latent_clean_predictions.cpu()
+            adv_pred_cpu = adv_pred.cpu()
+            result_loss_cpu = result_loss.cpu()
+            result_retained_cpu = result_retained_loss.cpu()
+            result_initial_cpu = result_initial_loss.cpu()
+            latent_delta_cpu = latent_delta_norm.cpu()
+            latent_base_cpu = latent_base_norm.cpu()
+            restart_cpu = result.restart.cpu() if rho > 0.0 and result.restart is not None else None
             target_rows = latent_rows
             surface = "pre_quantization" if discrete else "canonical_latent"
             for index, sample_id in enumerate(sample_ids):
                 target_rows.append(
                     {
                         "sample_id": sample_id,
-                        "label": int(labels[index]),
+                        "label": int(labels_cpu[index]),
                         "radius": rho,
-                        "clean_prediction": int(latent_clean_predictions[index]),
-                        "clean_correct": bool(latent_clean_predictions[index] == labels[index]),
-                        "adversarial_prediction": int(adv_pred[index]),
-                        "successful": bool(adv_pred[index] != labels[index]),
-                        "loss": float(result_loss[index]),
-                        "retained_loss": float(result_retained_loss[index]),
-                        "initial_loss": float(result_initial_loss[index]),
-                        "attack_surface": surface,
-                        "l2_norm": float(latent_delta_norm[index]),
-                        "relative_l2_norm": float(
-                            latent_delta_norm[index] / latent_base_norm[index]
+                        "clean_prediction": int(latent_clean_predictions_cpu[index]),
+                        "clean_correct": bool(
+                            latent_clean_predictions_cpu[index] == labels_cpu[index]
                         ),
+                        "adversarial_prediction": int(adv_pred_cpu[index]),
+                        "successful": bool(adv_pred_cpu[index] != labels_cpu[index]),
+                        "loss": float(result_loss_cpu[index]),
+                        "retained_loss": float(result_retained_cpu[index]),
+                        "initial_loss": float(result_initial_cpu[index]),
+                        "attack_surface": surface,
+                        "l2_norm": float(latent_delta_cpu[index]),
+                        "relative_l2_norm": float(latent_delta_cpu[index] / latent_base_cpu[index]),
                         "attack_seed": radius_seed,
                         "best_restart": (
-                            int(result.restart[index])
-                            if rho > 0.0 and result.restart is not None
-                            else -1
+                            int(restart_cpu[index]) if restart_cpu is not None else -1
                         ),
                         "checkpoint": checkpoint,
                         "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
@@ -464,34 +484,40 @@ def evaluate_attacks(
                 previous_ambient_candidate = diagnostic.adversarial.detach()
                 with torch.no_grad():
                     diagnostic_pred = model.classify_latent(diagnostic.adversarial).argmax(dim=-1)
+                diagnostic_pred_cpu = diagnostic_pred.cpu()
+                diagnostic_loss_cpu = diagnostic.loss.cpu()
+                diagnostic_retained_cpu = diagnostic.retained_loss.cpu()
+                diagnostic_initial_cpu = diagnostic.initial_loss.cpu()
+                diagnostic_restart_cpu = (
+                    diagnostic.restart.cpu() if diagnostic.restart is not None else None
+                )
+                diagnostic_delta = (diagnostic.adversarial - clean_output.latent).flatten(1)
+                diagnostic_l2_cpu = diagnostic_delta.norm(dim=1).cpu()
+                diagnostic_base_cpu = clean_output.latent.flatten(1).norm(dim=1).cpu()
                 for index, sample_id in enumerate(sample_ids):
                     latent_diagnostic_rows.append(
                         {
                             "sample_id": sample_id,
-                            "label": int(labels[index]),
+                            "label": int(labels_cpu[index]),
                             "radius": rho,
-                            "clean_prediction": int(latent_clean_predictions[index]),
-                            "clean_correct": bool(latent_clean_predictions[index] == labels[index]),
-                            "adversarial_prediction": int(diagnostic_pred[index]),
-                            "successful": bool(diagnostic_pred[index] != labels[index]),
-                            "loss": float(diagnostic.loss[index]),
-                            "retained_loss": float(diagnostic.retained_loss[index]),
-                            "initial_loss": float(diagnostic.initial_loss[index]),
-                            "attack_surface": "post_bottleneck_ambient",
-                            "l2_norm": float(
-                                (diagnostic.adversarial[index] - clean_output.latent[index])
-                                .flatten()
-                                .norm()
+                            "clean_prediction": int(latent_clean_predictions_cpu[index]),
+                            "clean_correct": bool(
+                                latent_clean_predictions_cpu[index] == labels_cpu[index]
                             ),
+                            "adversarial_prediction": int(diagnostic_pred_cpu[index]),
+                            "successful": bool(diagnostic_pred_cpu[index] != labels_cpu[index]),
+                            "loss": float(diagnostic_loss_cpu[index]),
+                            "retained_loss": float(diagnostic_retained_cpu[index]),
+                            "initial_loss": float(diagnostic_initial_cpu[index]),
+                            "attack_surface": "post_bottleneck_ambient",
+                            "l2_norm": float(diagnostic_l2_cpu[index]),
                             "relative_l2_norm": float(
-                                (diagnostic.adversarial[index] - clean_output.latent[index])
-                                .flatten()
-                                .norm()
-                                / clean_output.latent[index].flatten().norm().clamp_min(1e-12)
+                                diagnostic_l2_cpu[index]
+                                / diagnostic_base_cpu[index].clamp_min(1e-12)
                             ),
                             "best_restart": (
-                                int(diagnostic.restart[index])
-                                if diagnostic.restart is not None
+                                int(diagnostic_restart_cpu[index])
+                                if diagnostic_restart_cpu is not None
                                 else -1
                             ),
                             "attack_seed": radius_seed + 100_000,
@@ -892,7 +918,7 @@ def evaluate_autoencoder(
     )
     rows = []
     for batch in loader:
-        images = batch["image"].to(device)
+        images = batch["image"].to(device, non_blocking=True)
         with torch.no_grad():
             reconstruction = autoencoder(images).metadata["reconstruction"]
             original_logits = reference(images).logits
@@ -1010,22 +1036,29 @@ def evaluate_autoencoder_attacks(
             previous_input_candidate = result.adversarial.detach()
             with torch.no_grad():
                 adversarial_prediction = task(result.adversarial).logits.argmax(-1)
+                linf_norm = (result.adversarial - images).abs().flatten(1).amax(1)
+            labels_cpu = labels.cpu()
+            clean_predictions_cpu = clean_predictions.cpu()
+            adversarial_prediction_cpu = adversarial_prediction.cpu()
+            result_loss_cpu = result.loss.cpu()
+            result_retained_cpu = result.retained_loss.cpu()
+            result_initial_cpu = result.initial_loss.cpu()
+            linf_cpu = linf_norm.cpu()
+            restart_cpu = result.restart.cpu() if result.restart is not None else None
             input_rows.extend(
                 {
                     "sample_id": sample_id,
-                    "label": int(labels[index]),
+                    "label": int(labels_cpu[index]),
                     "radius": epsilon,
-                    "clean_prediction": int(clean_predictions[index]),
-                    "clean_correct": bool(clean_predictions[index] == labels[index]),
-                    "adversarial_prediction": int(adversarial_prediction[index]),
-                    "successful": bool(adversarial_prediction[index] != labels[index]),
-                    "loss": float(result.loss[index]),
-                    "retained_loss": float(result.retained_loss[index]),
-                    "initial_loss": float(result.initial_loss[index]),
-                    "linf_norm": float((result.adversarial[index] - images[index]).abs().max()),
-                    "best_restart": (
-                        int(result.restart[index]) if result.restart is not None else -1
-                    ),
+                    "clean_prediction": int(clean_predictions_cpu[index]),
+                    "clean_correct": bool(clean_predictions_cpu[index] == labels_cpu[index]),
+                    "adversarial_prediction": int(adversarial_prediction_cpu[index]),
+                    "successful": bool(adversarial_prediction_cpu[index] != labels_cpu[index]),
+                    "loss": float(result_loss_cpu[index]),
+                    "retained_loss": float(result_retained_cpu[index]),
+                    "initial_loss": float(result_initial_cpu[index]),
+                    "linf_norm": float(linf_cpu[index]),
+                    "best_restart": (int(restart_cpu[index]) if restart_cpu is not None else -1),
                     "attack_seed": batch_seed + round(epsilon * 255) * 10_000,
                     "checkpoint": autoencoder_checkpoint,
                     "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
@@ -1065,31 +1098,33 @@ def evaluate_autoencoder_attacks(
                 result_initial_loss = result.initial_loss
                 with torch.no_grad():
                     adversarial_prediction = task.classify_latent(adversarial_latent).argmax(-1)
+            labels_cpu = labels.cpu()
+            latent_clean_cpu = latent_clean_prediction.cpu()
+            adversarial_prediction_cpu = adversarial_prediction.cpu()
+            result_loss_cpu = result_loss.cpu()
+            result_retained_cpu = result_retained_loss.cpu()
+            result_initial_cpu = result_initial_loss.cpu()
+            latent_delta_cpu = (adversarial_latent - clean_latent).flatten(1).norm(dim=1).cpu()
+            latent_base_cpu = clean_latent.flatten(1).norm(dim=1).cpu()
+            restart_cpu = result.restart.cpu() if rho > 0.0 and result.restart is not None else None
             latent_rows.extend(
                 {
                     "sample_id": sample_id,
-                    "label": int(labels[index]),
+                    "label": int(labels_cpu[index]),
                     "radius": rho,
-                    "clean_prediction": int(latent_clean_prediction[index]),
-                    "clean_correct": bool(latent_clean_prediction[index] == labels[index]),
-                    "adversarial_prediction": int(adversarial_prediction[index]),
-                    "successful": bool(adversarial_prediction[index] != labels[index]),
-                    "loss": float(result_loss[index]),
-                    "retained_loss": float(result_retained_loss[index]),
-                    "initial_loss": float(result_initial_loss[index]),
+                    "clean_prediction": int(latent_clean_cpu[index]),
+                    "clean_correct": bool(latent_clean_cpu[index] == labels_cpu[index]),
+                    "adversarial_prediction": int(adversarial_prediction_cpu[index]),
+                    "successful": bool(adversarial_prediction_cpu[index] != labels_cpu[index]),
+                    "loss": float(result_loss_cpu[index]),
+                    "retained_loss": float(result_retained_cpu[index]),
+                    "initial_loss": float(result_initial_cpu[index]),
                     "attack_surface": "canonical_latent",
-                    "l2_norm": float(
-                        (adversarial_latent[index] - clean_latent[index]).flatten().norm()
-                    ),
+                    "l2_norm": float(latent_delta_cpu[index]),
                     "relative_l2_norm": float(
-                        (adversarial_latent[index] - clean_latent[index]).flatten().norm()
-                        / clean_latent[index].flatten().norm().clamp_min(1e-12)
+                        latent_delta_cpu[index] / latent_base_cpu[index].clamp_min(1e-12)
                     ),
-                    "best_restart": (
-                        int(result.restart[index])
-                        if rho > 0.0 and result.restart is not None
-                        else -1
-                    ),
+                    "best_restart": (int(restart_cpu[index]) if restart_cpu is not None else -1),
                     "attack_seed": batch_seed + 200_000 + round(rho * 1000) * 100,
                     "checkpoint": autoencoder_checkpoint,
                     "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
@@ -1491,67 +1526,39 @@ def evaluate_collision_attacks(
                     "source_label": int(labels[source_index]),
                     "target_label": int(labels[target_index]),
                     "epsilon": epsilon,
-                    "distance": float(distances[local]),
-                    "distance_percentile": float(
-                        (reference_distances <= float(distances[local])).double().mean() * 100.0
-                    ),
+                    "distance": float(distances_cpu[local]),
+                    "distance_percentile": float(distance_percentiles[local]),
                     "reference_source_preserved": bool(
-                        source_prediction[local] == source_labels[local]
+                        source_prediction_cpu[local] == labels[source_index]
                     ),
-                    "target_class_prediction": int(target_class_prediction[local]),
+                    "target_class_prediction": int(target_prediction_cpu[local]),
                     "target_class_reached": bool(
-                        target_class_prediction[local] == labels[target_index].to(device)
+                        target_prediction_cpu[local] == labels[target_index]
                     ),
-                    "collision_success": bool(result["successful"][local]),
+                    "collision_success": bool(success_cpu[local]),
                     "collision_criterion": result["criterion"],
-                    "linf_norm": float(
-                        (result["adversarial"][local] - source_images[local]).abs().max()
-                    ),
-                    "input_bound_satisfied": bool(
-                        (result["adversarial"][local] - source_images[local]).abs().max()
-                        <= epsilon + 1e-6
-                    ),
+                    "linf_norm": float(linf_cpu[local]),
+                    "input_bound_satisfied": bool(linf_cpu[local] <= epsilon + 1e-6),
                     "lambda_sem": lambda_sem,
-                    "attack_seed": int(config["attack"].get("seed", 2025))
-                    + round(epsilon * 255) * 100_000
-                    + start,
+                    "attack_seed": attack_seed,
                     "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
                 }
                 if result["criterion"] == "threshold":
-                    row["continuous_collision"] = bool(distances[local] < threshold)
-                if (
-                    "code_indices" in final_output.metadata
-                    and "code_indices" in target_output.metadata
-                ):
-                    row["exact_vq_collision"] = bool(
-                        torch.equal(
-                            final_output.metadata["code_indices"][local],
-                            target_output.metadata["code_indices"][local],
-                        )
-                    )
-                    row["vq_token_match_fraction"] = float(
-                        (
-                            final_output.metadata["code_indices"][local]
-                            == target_output.metadata["code_indices"][local]
-                        )
-                        .float()
-                        .mean()
-                    )
-                if (
-                    "quantized_latent" in final_output.metadata
-                    and "quantized_latent" in target_output.metadata
-                ):
-                    final_quantized = final_output.metadata["quantized_latent"][local]
-                    target_quantized = target_output.metadata["quantized_latent"][local]
-                    row["exact_quantized_collision"] = bool(
-                        torch.equal(final_quantized, target_quantized)
-                    )
+                    row["continuous_collision"] = bool(distances_cpu[local] < threshold)
+                if code_equal is not None:
+                    row["exact_vq_collision"] = bool(code_equal[local].all())
+                    row["vq_token_match_fraction"] = float(code_equal[local].float().mean())
+                if quantized_equal is not None:
+                    row["exact_quantized_collision"] = bool(quantized_equal[local].all())
                     row["quantized_bin_match_fraction"] = float(
-                        (final_quantized == target_quantized).float().mean()
+                        quantized_equal[local].float().mean()
                     )
-                rows.append(row)
+                batch_rows.append(row)
+            shard = pd.DataFrame(batch_rows)
+            save_frame(shard, shard_path)
+            shard_frames.append(shard)
     path = evaluation_dir / "collision_attacks.parquet"
-    save_frame(pd.DataFrame(rows), path)
+    save_frame(pd.concat(shard_frames, ignore_index=True), path)
     write_json(
         path.with_suffix(".json"),
         {
@@ -1604,7 +1611,9 @@ def evaluate_square_attack(
     for batch_start in range(0, len(selected_indices), evaluation_batch_size):
         indices = selected_indices[batch_start : batch_start + evaluation_batch_size]
         samples = [dataset[index] for index in indices]
-        images = torch.stack([sample["image"] for sample in samples]).to(device)
+        images = torch.stack([sample["image"] for sample in samples]).to(
+            device, non_blocking=True
+        )
         labels = torch.tensor([sample["label"] for sample in samples], device=device)
         sample_ids = [str(sample["sample_id"]) for sample in samples]
         with torch.no_grad():
@@ -1629,23 +1638,33 @@ def evaluate_square_attack(
                         model, result.adversarial, _sample_count(config), radius_seed + 50_000
                     )
                 )
+                linf_norm = (result.adversarial - images).abs().flatten(1).amax(1)
+            labels_cpu = labels.cpu()
+            clean_prediction_cpu = clean_logits.argmax(1).cpu()
+            adversarial_prediction_cpu = adversarial_logits.argmax(1).cpu()
+            result_loss_cpu = result.loss.cpu()
+            result_retained_cpu = result.retained_loss.cpu()
+            result_initial_cpu = result.initial_loss.cpu()
+            linf_cpu = linf_norm.cpu()
             for index, sample_id in enumerate(sample_ids):
                 rows.append(
                     {
                         "sample_id": sample_id,
-                        "label": int(labels[index]),
+                        "label": int(labels_cpu[index]),
                         "radius": epsilon,
-                        "clean_prediction": int(clean_logits[index].argmax()),
-                        "clean_correct": bool(clean_logits[index].argmax() == labels[index]),
-                        "adversarial_prediction": int(adversarial_logits[index].argmax()),
-                        "successful": bool(adversarial_logits[index].argmax() != labels[index]),
-                        "loss": float(result.loss[index]),
-                        "retained_loss": float(result.retained_loss[index]),
-                        "initial_loss": float(result.initial_loss[index]),
+                        "clean_prediction": int(clean_prediction_cpu[index]),
+                        "clean_correct": bool(clean_prediction_cpu[index] == labels_cpu[index]),
+                        "adversarial_prediction": int(adversarial_prediction_cpu[index]),
+                        "successful": bool(
+                            adversarial_prediction_cpu[index] != labels_cpu[index]
+                        ),
+                        "loss": float(result_loss_cpu[index]),
+                        "retained_loss": float(result_retained_cpu[index]),
+                        "initial_loss": float(result_initial_cpu[index]),
                         "queries": int(config["attack"].get("square_queries", 5000)),
                         "attack_seed": radius_seed,
                         "checkpoint": checkpoint,
-                        "linf_norm": float((result.adversarial[index] - images[index]).abs().max()),
+                        "linf_norm": float(linf_cpu[index]),
                         "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
                     }
                 )
@@ -1801,7 +1820,9 @@ def evaluate_transfer_attack(
     for start in range(0, len(selected_indices), batch_size):
         indices = selected_indices[start : start + batch_size]
         samples = [dataset[index] for index in indices]
-        images = torch.stack([sample["image"] for sample in samples]).to(target_device)
+        images = torch.stack([sample["image"] for sample in samples]).to(
+            target_device, non_blocking=True
+        )
         labels = torch.tensor([sample["label"] for sample in samples], device=target_device)
         with torch.no_grad():
             target_clean = target(images, sample=False).logits.argmax(1)
