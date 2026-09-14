@@ -140,12 +140,11 @@ def targeted_collision_attack(
                 else:
                     attack_distance = normalized_distance
                     collision_condition = normalized_distance < threshold
-                source_loss = F.cross_entropy(
-                    reference_classifier(adv).logits.float(), source_label, reduction="none"
-                )
+                reference_logits = reference_classifier(adv).logits.float()
+                source_loss = F.cross_entropy(reference_logits, source_label, reduction="none")
                 objective = attack_distance + lambda_sem * source_loss
                 with torch.no_grad():
-                    reference_prediction = reference_classifier(adv).logits.argmax(dim=-1)
+                    reference_prediction = reference_logits.argmax(dim=-1)
                     success = (reference_prediction == source_label) & collision_condition
                     replace = (success & ~best_success) | (
                         (success == best_success) & (attack_distance < best_score)

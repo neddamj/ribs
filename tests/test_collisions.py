@@ -24,7 +24,12 @@ class TinyVQ(torch.nn.Module):
 
 
 class SourceReference(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.forward_calls = 0
+
     def forward(self, images, sample=False):
+        self.forward_calls += 1
         connected = images.mean((1, 2, 3)) * 0
         return SimpleNamespace(logits=torch.stack([connected + 1, connected], dim=1))
 
@@ -46,3 +51,20 @@ def test_vq_collision_attack_optimizes_prequantization_tokens():
     )
     assert result["criterion"] == "exact_vq"
     assert bool(result["successful"][0])
+
+
+def test_collision_attack_reuses_reference_logits_for_loss_and_prediction():
+    reference = SourceReference()
+    targeted_collision_attack(
+        TinyVQ(),
+        reference,
+        torch.full((1, 1, 2, 2), 0.9),
+        torch.zeros(1, dtype=torch.long),
+        torch.full((1, 1, 2, 2), 0.1),
+        epsilon=1.0,
+        threshold=0.1,
+        steps=3,
+        restarts=2,
+        lambda_sem=0.0,
+    )
+    assert reference.forward_calls == 2 * (3 + 1)
