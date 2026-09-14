@@ -123,4 +123,5 @@ if (( failed )); then
 fi
 
 PYTHON_BIN="${python_bin}" OUTPUT_ROOT="${output_root}" \
-  "$(dirname "$0")/run_phase2_postprocess.sh" "${config_root}" "${decision_record}"
+  GPU_COUNT="${gpu_count}" "$(dirname "$0")/run_phase2_postprocess_parallel.sh" \
+  "${config_root}" "${decision_record}"
