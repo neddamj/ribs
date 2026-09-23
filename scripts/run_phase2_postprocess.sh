@@ -10,6 +10,7 @@ read -r -a phase2_families <<< "${PHASE2_FAMILIES:-vib vq quantized autoencoder}
 read -r -a phase2_skip_run_dirs <<< "${PHASE2_SKIP_RUN_DIRS:-}"
 read -r -a phase2_run_dirs <<< "${PHASE2_RUN_DIRS:-}"
 run_tag="${PHASE2_RUN_TAG:-$(date -u +%Y%m%dT%H%M%SZ)}"
+runtime_amendment="${PHASE2_RUNTIME_AMENDMENT:-configs/phase2_runtime_amendment_20260917.yaml}"
 status_tsv="$(mktemp)"
 printf 'family\trun_dir\tstage\tstatus\tduration_seconds\n' >"${status_tsv}"
 
@@ -131,10 +132,65 @@ has_completed_analysis() {
   return 1
 }
 
+has_passed_attack_diagnostics() {
+  local run_dir="$1"
+  local prefix="attack-diagnostics-"
+  local candidate
+  while IFS= read -r candidate; do
+    [[ -f "${candidate}/COMPLETED" && -f "${candidate}/diagnostics.json" ]] || continue
+    if "${python_bin}" -c \
+      'import json,sys; x=json.load(open(sys.argv[1])); raise SystemExit(0 if x.get("attack_protocol_version") == 2 and x.get("status") == "passed" else 1)' \
+      "${candidate}/diagnostics.json"; then
+      return 0
+    fi
+  done < <(find "${run_dir}/evaluations" -mindepth 1 -maxdepth 1 -type d \
+    -name "${prefix}*-attempt*" -print 2>/dev/null | sort)
+  return 1
+}
+
+has_completed_attack_diagnostics() {
+  local run_dir="$1"
+  local candidate
+  while IFS= read -r candidate; do
+    if [[ -f "${candidate}/COMPLETED" && -f "${candidate}/diagnostics.json" ]] && \
+       "${python_bin}" -c \
+         'import json,sys; x=json.load(open(sys.argv[1])); raise SystemExit(0 if x.get("attack_protocol_version") == 2 and not x.get("independent_audit", False) else 1)' \
+         "${candidate}/diagnostics.json"; then
+      return 0
+    fi
+  done < <(find "${run_dir}/evaluations" -mindepth 1 -maxdepth 1 -type d \
+    -name 'attack-diagnostics-*-attempt*' -print 2>/dev/null | sort)
+  return 1
+}
+
+has_completed_masking_kind() {
+  local run_dir="$1"
+  local prefix="$2"
+  local candidate
+  while IFS= read -r candidate; do
+    [[ -f "${candidate}/COMPLETED" && -f "${candidate}/config.json" ]] || continue
+    if "${python_bin}" -c \
+      'import json,sys; x=json.load(open(sys.argv[1])); raise SystemExit(0 if x.get("split") == "final" and x.get("max_samples") == 1000 and x.get("attack_protocol_version") == 2 else 1)' \
+      "${candidate}/config.json"; then
+      return 0
+    fi
+  done < <(find "${run_dir}/evaluations" -mindepth 1 -maxdepth 1 -type d \
+    -name "${prefix}*-attempt*" -print 2>/dev/null | sort)
+  return 1
+}
+
 process_run() {
   local run_dir="$1"
   local family="$2"
   local failed=0
+  local run_robustness run_masking run_phase3
+  if ! IFS=$'\t' read -r run_robustness run_masking run_phase3 < <(
+    "${python_bin}" -m ribs.cli phase2-runtime-policy \
+      --run-dir "${run_dir}" --amendment "${runtime_amendment}"
+  ); then
+    record_stage "${family}" "${run_dir}" runtime_policy failed 0
+    return 1
+  fi
   echo "START phase2 postprocess family=${family} run=${run_dir} $(date -Is)"
   if [[ ! -f "${run_dir}/artifacts/latents_development_tune.safetensors" ]]; then
     run_stage "${family}" "${run_dir}" latents_development_tune \
@@ -150,9 +206,11 @@ process_run() {
     has_completed_kind "${run_dir}" "autoencoder-clean-" false true || run_stage \
       "${family}" "${run_dir}" clean "${python_bin}" -m ribs.cli evaluate-autoencoder \
       --run-dir "${run_dir}" --reference-run-dir "${reference_run}" || failed=1
-    has_completed_kind "${run_dir}" "autoencoder-robustness-" true true || run_stage \
-      "${family}" "${run_dir}" robustness "${python_bin}" -m ribs.cli autoencoder-attack \
-      --run-dir "${run_dir}" --reference-run-dir "${reference_run}" || failed=1
+    if [[ "${run_robustness}" == 1 ]]; then
+      has_completed_kind "${run_dir}" "autoencoder-robustness-" true true || run_stage \
+        "${family}" "${run_dir}" robustness "${python_bin}" -m ribs.cli autoencoder-attack \
+        --run-dir "${run_dir}" --reference-run-dir "${reference_run}" || failed=1
+    fi
     has_completed_analysis "${run_dir}" geometry geometry.json geometry_final.json || run_stage \
       "${family}" "${run_dir}" geometry "${python_bin}" -m ribs.cli analyze \
       --run-dir "${run_dir}" --experiment geometry || failed=1
@@ -164,63 +222,37 @@ process_run() {
     has_completed_kind "${run_dir}" "clean-" false true || run_stage \
       "${family}" "${run_dir}" clean "${python_bin}" -m ribs.cli evaluate \
       --run-dir "${run_dir}" || failed=1
-    has_completed_kind "${run_dir}" "robustness-" true true || run_stage \
-      "${family}" "${run_dir}" robustness "${python_bin}" -m ribs.cli attack \
-      --run-dir "${run_dir}" || failed=1
+    if [[ "${run_robustness}" == 1 ]]; then
+      has_completed_kind "${run_dir}" "robustness-" true true || run_stage \
+        "${family}" "${run_dir}" robustness "${python_bin}" -m ribs.cli attack \
+        --run-dir "${run_dir}" || failed=1
+      if has_completed_kind "${run_dir}" "robustness-" true true && \
+         ! has_passed_attack_diagnostics "${run_dir}"; then
+        if has_completed_attack_diagnostics "${run_dir}"; then
+          record_stage "${family}" "${run_dir}" attack_diagnostics failed 0
+          echo "FAILED stage=attack_diagnostics family=${family} run=${run_dir} reason=existing_primary_diagnostic_failed" >&2
+          failed=1
+        else
+          run_stage "${family}" "${run_dir}" attack_diagnostics \
+            "${python_bin}" -m ribs.cli attack-diagnostics --run-dir "${run_dir}" \
+            || failed=1
+        fi
+      fi
+    fi
     has_completed_analysis "${run_dir}" geometry geometry.json geometry_final.json || run_stage \
       "${family}" "${run_dir}" geometry "${python_bin}" -m ribs.cli analyze \
       --run-dir "${run_dir}" --experiment geometry || failed=1
     has_completed_analysis "${run_dir}" invariance invariance.json invariance_final.json || run_stage \
       "${family}" "${run_dir}" invariance "${python_bin}" -m ribs.cli analyze \
       --run-dir "${run_dir}" --experiment invariance || failed=1
-    if [[ "${family}" == vq || "${family}" == quantized ]]; then
-      has_completed_kind "${run_dir}" "square-" true || run_stage \
+    if [[ "${run_masking}" == 1 ]]; then
+      has_completed_masking_kind "${run_dir}" "square-" || run_stage \
         "${family}" "${run_dir}" square "${python_bin}" -m ribs.cli square-attack \
         --run-dir "${run_dir}" || failed=1
-      has_completed_kind "${run_dir}" "transfer-" true || run_stage \
+      has_completed_masking_kind "${run_dir}" "transfer-" || run_stage \
         "${family}" "${run_dir}" transfer "${python_bin}" -m ribs.cli transfer-attack \
         --run-dir "${run_dir}" || failed=1
     fi
-  fi
-  local tuning_artifact
-  local tuning_candidates=()
-  local collision_lambdas=()
-  mapfile -t tuning_candidates < <(
-    find "${run_dir}/evaluations" -mindepth 2 -maxdepth 2 -type f \
-      -path '*/collision-tuning-*-attempt*/selection.json' -print 2>/dev/null | \
-      while read -r path; do
-        [[ -f "${path%/selection.json}/COMPLETED" ]] && echo "${path}"
-      done | sort
-  )
-  if [[ "${#tuning_candidates[@]}" -gt 1 ]]; then
-    echo "Multiple completed collision tuning artifacts require explicit resolution: ${run_dir}" >&2
-    failed=1
-    tuning_artifact=""
-  fi
-  if [[ "${#tuning_candidates[@]}" -eq 0 ]]; then
-    read -r -a collision_lambdas <<< "${COLLISION_LAMBDAS:-0.1 0.3 1 3 10}"
-    local started=$SECONDS
-    if tuning_artifact="$("${python_bin}" -m ribs.cli tune-collision \
-      --run-dir "${run_dir}" --reference-run-dir "${reference_run}" \
-      --lambdas "${collision_lambdas[@]}" \
-      --max-pairs "${COLLISION_TUNING_PAIRS:-200}")"; then
-      record_stage "${family}" "${run_dir}" collision_tuning completed "$((SECONDS - started))"
-    else
-      record_stage "${family}" "${run_dir}" collision_tuning failed "$((SECONDS - started))"
-      failed=1
-      tuning_artifact=""
-    fi
-  elif [[ "${#tuning_candidates[@]}" -eq 1 ]]; then
-    tuning_artifact="${tuning_candidates[0]}"
-  fi
-  if [[ -n "${tuning_artifact}" ]]; then
-    has_completed_kind "${run_dir}" "collision-" true true || run_stage \
-      "${family}" "${run_dir}" collision "${python_bin}" -m ribs.cli collision-attack \
-      --run-dir "${run_dir}" --reference-run-dir "${reference_run}" \
-      --tuning-artifact "${tuning_artifact}" --max-pairs "${COLLISION_FINAL_PAIRS:-1000}" \
-      || failed=1
-  else
-    record_stage "${family}" "${run_dir}" collision blocked 0
   fi
   echo "DONE phase2 postprocess family=${family} run=${run_dir} $(date -Is)"
   return "${failed}"
@@ -246,11 +278,13 @@ done
 
 if [[ "${PHASE2_FINALIZE:-true}" == true ]]; then
   "${python_bin}" -m ribs.cli aggregate --output-root "${output_root}" --experiment phase2 \
-    --include-families dimensional vib vq quantized autoencoder || failed_runs=$((failed_runs + 1))
+    --include-families dimensional vib vq quantized autoencoder \
+    --runtime-amendment "${runtime_amendment}" || failed_runs=$((failed_runs + 1))
   "${python_bin}" -m ribs.cli render --experiment phase2 \
     --summary "${output_root}/phase2_summary.parquet" \
     --output-dir "${output_root}/figures_phase2" || failed_runs=$((failed_runs + 1))
   "${python_bin}" -m ribs.cli validate-phase2 --output-root "${output_root}" \
+    --runtime-amendment "${runtime_amendment}" \
     || failed_runs=$((failed_runs + 1))
 fi
 

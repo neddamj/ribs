@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pandas as pd
 import yaml
@@ -8,6 +9,8 @@ from ribs.analysis import (
     _new_analysis_dir,
     aggregate_completed_runs,
 )
+
+PROJECT_ROOT = Path(__file__).parents[1]
 
 
 def test_aggregate_completed_run_fixture(tmp_path):
@@ -102,3 +105,28 @@ def test_analysis_attempts_are_immutable_and_truncated_attempts_are_not_final(tm
 
     assert selected == full / "geometry.json"
     assert partial != full
+
+
+def test_phase2_amendment_keeps_omitted_runs_in_representation_summary(tmp_path):
+    run_dir = tmp_path / "vib" / "run"
+    run_dir.mkdir(parents=True)
+    config = {
+        "seed": 0,
+        "model": {"family": "vib", "dz": 128, "beta": 0.0001},
+        "attack": {"input_epsilons": [0.0, 1.0], "latent_rhos": [1.0]},
+    }
+    (run_dir / "resolved_config.yaml").write_text(yaml.safe_dump(config))
+    (run_dir / "COMPLETED").write_text("completed\n")
+    (run_dir / "metrics.json").write_text(json.dumps({"codebook_collapsed": False}))
+
+    summary = aggregate_completed_runs(
+        tmp_path,
+        output_prefix="phase2",
+        include_families=["vib"],
+        runtime_amendment=PROJECT_ROOT / "configs" / "phase2_runtime_amendment_20260917.yaml",
+    )
+
+    representation = pd.read_parquet(tmp_path / "phase2_representation_summary.parquet")
+    assert summary.empty
+    assert representation.run_dir.tolist() == [str(run_dir)]
+    assert representation.strength_value.tolist() == ["0.0001"]

@@ -33,6 +33,8 @@ from ..evaluation import (
 )
 from ..phase2 import (
     canonical_completed_runs,
+    load_runtime_amendment,
+    runtime_policy_for_config,
     valid_identity_run,
     validate_decision_record,
     write_duplicate_provenance,
@@ -161,14 +163,19 @@ def build_parser() -> argparse.ArgumentParser:
     aggregate.add_argument("--output-root", default="outputs")
     aggregate.add_argument("--experiment", choices=["phase1", "phase2"], default="phase1")
     aggregate.add_argument("--include-families", nargs="+")
+    aggregate.add_argument("--runtime-amendment")
     validate = subparsers.add_parser("validate-phase1")
     validate.add_argument("--output-root", default="outputs")
     validate2 = subparsers.add_parser("validate-phase2")
     validate2.add_argument("--output-root", default="outputs")
+    validate2.add_argument("--runtime-amendment")
     run_manifest = subparsers.add_parser("phase2-run-dirs")
     run_manifest.add_argument("--output-root", default="outputs")
     run_manifest.add_argument("--families", nargs="+", required=True)
     run_manifest.add_argument("--audit-path", required=True)
+    runtime_policy = subparsers.add_parser("phase2-runtime-policy")
+    runtime_policy.add_argument("--run-dir", required=True)
+    runtime_policy.add_argument("--amendment", required=True)
     identity_followup = subparsers.add_parser("analyze-identity-followup")
     identity_followup.add_argument("--output-root", default="outputs")
     identity_followup.add_argument("--report-path")
@@ -283,6 +290,24 @@ def main(argv: list[str] | None = None) -> int:
         for run_dir in canonical:
             print(f"{run_dir.parent.name}\t{run_dir}")
         return 0
+    if args.command == "phase2-runtime-policy":
+        import yaml
+
+        config = yaml.safe_load(
+            (Path(args.run_dir) / "resolved_config.yaml").read_text(encoding="utf-8")
+        )
+        policy = runtime_policy_for_config(config, load_runtime_amendment(args.amendment))
+        print(
+            "\t".join(
+                "1" if policy[key] else "0"
+                for key in (
+                    "phase2_robustness",
+                    "phase2_masking_checks",
+                    "phase3_collision",
+                )
+            )
+        )
+        return 0
     if args.command in {"render", "aggregate", "validate-phase1", "validate-phase2"}:
         if args.command == "render":
             from ..plotting import render_phase1, render_phase2
@@ -304,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.output_root,
                     output_prefix=args.experiment,
                     include_families=families,
+                    runtime_amendment=args.runtime_amendment,
                 ).to_string(index=False)
             )
         elif args.command == "validate-phase1":
@@ -314,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             from ..analysis import validate_phase2_acceptance
 
-            report = validate_phase2_acceptance(args.output_root)
+            report = validate_phase2_acceptance(args.output_root, args.runtime_amendment)
             print(report)
             if report["status"] != "ready":
                 return 2

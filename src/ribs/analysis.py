@@ -350,6 +350,7 @@ def aggregate_completed_runs(
     output_root: str | Path = "outputs",
     output_prefix: str = "phase1",
     include_families: list[str] | tuple[str, ...] | None = None,
+    runtime_amendment: str | Path | None = None,
 ) -> pd.DataFrame:
     """Aggregate completed records into a namespaced result table.
 
@@ -362,6 +363,7 @@ def aggregate_completed_runs(
     sample_rows = []
     distance_rows = []
     collision_attack_rows = []
+    representation_rows = []
     clean_records: dict[str, pd.DataFrame] = {}
     allowed = set(include_families) if include_families is not None else None
     completed_runs = []
@@ -379,6 +381,7 @@ def aggregate_completed_runs(
         if allowed is None or family in allowed:
             completed_runs.append(path)
     phase2_families = {"vib", "vq", "quantized", "autoencoder"}
+    amendment = None
     if output_prefix == "phase2" and (allowed is None or allowed & phase2_families):
         from .phase2 import canonical_completed_runs
 
@@ -390,6 +393,10 @@ def aggregate_completed_runs(
             for path in completed_runs
             if path.parent.name not in phase2_families or str(path) in canonical_set
         ]
+        if runtime_amendment is not None:
+            from .phase2 import load_runtime_amendment
+
+            amendment = load_runtime_amendment(runtime_amendment)
     manifest_hashes = {
         (run_dir / "data_manifest_hash.txt").read_text().strip()
         for run_dir in completed_runs
@@ -414,6 +421,17 @@ def aggregate_completed_runs(
             "codebook_collapsed": bool(run_metrics.get("codebook_collapsed", False)),
             **config.get("model", {}),
         }
+        include_robustness = True
+        include_collision = True
+        if amendment is not None:
+            from .phase2 import runtime_policy_for_config
+
+            runtime_policy = runtime_policy_for_config(config, amendment)
+            include_robustness = (
+                base.get("family") == "dimensional"
+                or runtime_policy["phase2_robustness"]
+            )
+            include_collision = runtime_policy["phase3_collision"]
         if base.get("family") == "autoencoder":
             clean_summaries = [
                 candidate / "reconstruction_final.json"
@@ -433,11 +451,30 @@ def aggregate_completed_runs(
                 ):
                     if key in clean_summary:
                         base[key] = clean_summary[key]
+        else:
+            clean_summaries = []
+            for candidate in (run_dir / "evaluations").glob("clean-*-attempt*"):
+                summary_path = candidate / "clean_final.json"
+                if not (candidate / "COMPLETED").exists() or not summary_path.exists():
+                    continue
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                if summary.get("split") == "final" and summary.get("max_samples") is None:
+                    clean_summaries.append(summary_path)
+            if len(clean_summaries) > 1:
+                raise ValueError(f"Multiple final clean evaluations for {run_dir}")
+            if clean_summaries:
+                clean_summary = json.loads(clean_summaries[0].read_text(encoding="utf-8"))
+                if "clean_accuracy" in clean_summary:
+                    base["clean_accuracy"] = clean_summary["clean_accuracy"]
         evaluation_dirs = []
-        candidates = [
-            *(run_dir / "evaluations").glob("robustness-*-attempt*"),
-            *(run_dir / "evaluations").glob("autoencoder-robustness-*-attempt*"),
-        ]
+        candidates = (
+            [
+                *(run_dir / "evaluations").glob("robustness-*-attempt*"),
+                *(run_dir / "evaluations").glob("autoencoder-robustness-*-attempt*"),
+            ]
+            if include_robustness
+            else []
+        )
         for candidate in candidates:
             config_file = candidate / "config.json"
             if not (candidate / "COMPLETED").exists() or not config_file.exists():
@@ -499,6 +536,8 @@ def aggregate_completed_runs(
                 and (candidate / "square_attack.parquet").exists()
                 and (candidate / "config.json").exists()
                 and json.loads((candidate / "config.json").read_text()).get("split") == "final"
+                and json.loads((candidate / "config.json").read_text()).get("max_samples")
+                == 1000
                 and json.loads((candidate / "config.json").read_text()).get(
                     "attack_protocol_version"
                 )
@@ -555,6 +594,8 @@ def aggregate_completed_runs(
                 and (candidate / "transfer_attack.parquet").exists()
                 and (candidate / "config.json").exists()
                 and json.loads((candidate / "config.json").read_text()).get("split") == "final"
+                and json.loads((candidate / "config.json").read_text()).get("max_samples")
+                == 1000
                 and json.loads((candidate / "config.json").read_text()).get(
                     "attack_protocol_version"
                 )
@@ -583,6 +624,7 @@ def aggregate_completed_runs(
         )
         if geometry_path is not None:
             geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+            base.update(geometry)
             for row in rows:
                 if row["run_dir"] == str(run_dir):
                     row.update(geometry)
@@ -591,6 +633,7 @@ def aggregate_completed_runs(
         )
         if invariance_path is not None:
             invariance = json.loads(invariance_path.read_text(encoding="utf-8"))
+            base.update(invariance)
             for row in rows:
                 if row["run_dir"] == str(run_dir):
                     row.update(invariance)
@@ -607,8 +650,22 @@ def aggregate_completed_runs(
                 {**base, **record}
                 for record in natural_records[["sample_id", "distance"]].to_dict("records")
             )
+        natural_summary_path = _completed_analysis_file(
+            run_dir,
+            "geometry",
+            "final",
+            "natural_collision_summary.json",
+        )
+        if natural_summary_path is not None:
+            base.update(json.loads(natural_summary_path.read_text(encoding="utf-8")))
+        representation_rows.append(base.copy())
         collision_dirs = []
-        for candidate in (run_dir / "evaluations").glob("collision-*-attempt*"):
+        collision_candidates = (
+            (run_dir / "evaluations").glob("collision-*-attempt*")
+            if include_collision
+            else ()
+        )
+        for candidate in collision_candidates:
             if (
                 not (candidate / "COMPLETED").exists()
                 or not (candidate / "collision_attacks.parquet").exists()
@@ -635,14 +692,25 @@ def aggregate_completed_runs(
                 {**base, **record} for record in collision_attacks.to_dict("records")
             )
     frame = pd.DataFrame(rows)
+    representation_frame = pd.DataFrame(representation_rows)
     output_path = Path(output_root)
     if output_prefix == "phase2" and not frame.empty:
         frame = phase2_strength_columns(frame)
         curve_rows = phase2_strength_columns(pd.DataFrame(curve_rows)).to_dict("records")
         sample_rows = phase2_strength_columns(pd.DataFrame(sample_rows)).to_dict("records")
+    if output_prefix == "phase2" and not representation_frame.empty:
+        representation_frame = phase2_strength_columns(representation_frame)
     save_frame(frame, output_path / f"{output_prefix}_summary.parquet")
     frame.to_csv(output_path / f"{output_prefix}_summary.csv", index=False)
     save_frame(pd.DataFrame(curve_rows), output_path / f"{output_prefix}_curves.parquet")
+    if output_prefix == "phase2":
+        save_frame(
+            representation_frame,
+            output_path / f"{output_prefix}_representation_summary.parquet",
+        )
+        representation_frame.to_csv(
+            output_path / f"{output_prefix}_representation_summary.csv", index=False
+        )
     shared_clean_frame = pd.DataFrame()
     if clean_records:
         shared_clean_frame = shared_clean_correct(clean_records)
@@ -1310,9 +1378,17 @@ def validate_phase1_acceptance(output_root: str | Path = "outputs") -> dict[str,
     return report
 
 
-def validate_phase2_acceptance(output_root: str | Path = "outputs") -> dict[str, Any]:
+def validate_phase2_acceptance(
+    output_root: str | Path = "outputs",
+    runtime_amendment: str | Path | None = None,
+) -> dict[str, Any]:
     """Validate the final artifact contract for the four new Phase 2 families."""
     output_root = Path(output_root)
+    amendment = None
+    if runtime_amendment is not None:
+        from .phase2 import load_runtime_amendment
+
+        amendment = load_runtime_amendment(runtime_amendment)
     expected = {
         (family, value, seed)
         for family in ("vib", "vq", "quantized", "autoencoder")
@@ -1368,6 +1444,15 @@ def validate_phase2_acceptance(output_root: str | Path = "outputs") -> dict[str,
             errors.append(f"missing Phase 2 run family={key[0]} strength={key[1]} seed={key[2]}")
     for key, run_dir in observed.items():
         config = yaml.safe_load((run_dir / "resolved_config.yaml").read_text(encoding="utf-8"))
+        if amendment is None:
+            policy = {
+                "phase2_robustness": True,
+                "phase2_masking_checks": key[0] in {"vq", "quantized"},
+            }
+        else:
+            from .phase2 import runtime_policy_for_config
+
+            policy = runtime_policy_for_config(config, amendment)
         decision_reference = config.get("phase2_decision_record")
         if not isinstance(decision_reference, dict):
             errors.append(f"missing embedded Phase 2 decision record: {run_dir}")
@@ -1440,9 +1525,11 @@ def validate_phase2_acceptance(output_root: str | Path = "outputs") -> dict[str,
             and json.loads((candidate / "config.json").read_text()).get("attack_protocol_version")
             == ATTACK_PROTOCOL_VERSION
         ]
-        if len(final_robustness) != 1:
+        if (
+            not final_robustness and policy["phase2_robustness"]
+        ) or len(final_robustness) > 1:
             errors.append(f"expected one final robustness evaluation: {run_dir}")
-        else:
+        elif final_robustness:
             evaluation = final_robustness[0]
             evaluation_config = json.loads((evaluation / "config.json").read_text())
             if evaluation_config.get("max_samples") is not None:
@@ -1488,7 +1575,7 @@ def validate_phase2_acceptance(output_root: str | Path = "outputs") -> dict[str,
                         and (records.relative_l2_norm > records.radius.astype(float) + 1e-5).any()
                     ):
                         errors.append(f"latent attack bound violation: {evaluation / filename}")
-            if key[0] in {"vq", "quantized"}:
+            if policy["phase2_masking_checks"]:
                 square = [
                     candidate
                     for candidate in (run_dir / "evaluations").glob("square-*-attempt*")
@@ -1507,6 +1594,11 @@ def validate_phase2_acceptance(output_root: str | Path = "outputs") -> dict[str,
                 ]
                 if len(square) != 1:
                     errors.append(f"expected one final Square Attack evaluation: {run_dir}")
+                elif (
+                    json.loads((square[0] / "config.json").read_text()).get("max_samples")
+                    != 1000
+                ):
+                    errors.append(f"Square Attack does not use the registered subset: {run_dir}")
                 transfer = [
                     candidate
                     for candidate in (run_dir / "evaluations").glob("transfer-*-attempt*")
@@ -1525,40 +1617,49 @@ def validate_phase2_acceptance(output_root: str | Path = "outputs") -> dict[str,
                     json.loads((transfer[0] / "config.json").read_text()).get("max_samples") != 1000
                 ):
                     errors.append(f"transfer attack does not use the registered subset: {run_dir}")
-        collision = [
-            candidate
-            for candidate in (run_dir / "evaluations").glob("collision-*-attempt*")
-            if (candidate / "COMPLETED").exists()
-            and (candidate / "collision_attacks.parquet").exists()
-            and (candidate / "config.json").exists()
-            and json.loads((candidate / "config.json").read_text()).get("split") == "final"
-            and json.loads((candidate / "config.json").read_text()).get("attack_protocol_version")
-            == ATTACK_PROTOCOL_VERSION
-        ]
-        if len(collision) != 1:
-            errors.append(f"expected one final collision evaluation: {run_dir}")
-        else:
-            collision_config = json.loads((collision[0] / "config.json").read_text())
-            tuning_artifact_value = collision_config.get("tuning_artifact")
-            tuning_artifact = Path(tuning_artifact_value) if tuning_artifact_value else None
-            if (
-                tuning_artifact is None
-                or not tuning_artifact.is_file()
-                or collision_config.get("tuning_artifact_sha256") != sha256_file(tuning_artifact)
-            ):
-                errors.append(f"collision tuning artifact is missing or changed: {run_dir}")
-            collision_records_frame = pd.read_parquet(collision[0] / "collision_attacks.parquet")
-            expected_collision_radii = {
-                0.0,
-                *(float(value) for value in config["attack"]["input_epsilons"]),
-            }
-            if set(collision_records_frame.epsilon.astype(float)) != expected_collision_radii:
-                errors.append(f"incorrect collision epsilon grid: {run_dir}")
-            if (
-                "input_bound_satisfied" not in collision_records_frame
-                or not collision_records_frame.input_bound_satisfied.astype(bool).all()
-            ):
-                errors.append(f"collision input-bound check failed: {run_dir}")
+        if amendment is None:
+            collision = [
+                candidate
+                for candidate in (run_dir / "evaluations").glob("collision-*-attempt*")
+                if (candidate / "COMPLETED").exists()
+                and (candidate / "collision_attacks.parquet").exists()
+                and (candidate / "config.json").exists()
+                and json.loads((candidate / "config.json").read_text()).get("split") == "final"
+                and json.loads((candidate / "config.json").read_text()).get(
+                    "attack_protocol_version"
+                )
+                == ATTACK_PROTOCOL_VERSION
+            ]
+            if len(collision) != 1:
+                errors.append(f"expected one final collision evaluation: {run_dir}")
+            else:
+                collision_config = json.loads((collision[0] / "config.json").read_text())
+                tuning_artifact_value = collision_config.get("tuning_artifact")
+                tuning_artifact = Path(tuning_artifact_value) if tuning_artifact_value else None
+                if (
+                    tuning_artifact is None
+                    or not tuning_artifact.is_file()
+                    or collision_config.get("tuning_artifact_sha256")
+                    != sha256_file(tuning_artifact)
+                ):
+                    errors.append(f"collision tuning artifact is missing or changed: {run_dir}")
+                collision_records_frame = pd.read_parquet(
+                    collision[0] / "collision_attacks.parquet"
+                )
+                expected_collision_radii = {
+                    0.0,
+                    *(float(value) for value in config["attack"]["input_epsilons"]),
+                }
+                if (
+                    set(collision_records_frame.epsilon.astype(float))
+                    != expected_collision_radii
+                ):
+                    errors.append(f"incorrect collision epsilon grid: {run_dir}")
+                if (
+                    "input_bound_satisfied" not in collision_records_frame
+                    or not collision_records_frame.input_bound_satisfied.astype(bool).all()
+                ):
+                    errors.append(f"collision input-bound check failed: {run_dir}")
         clean = []
         for candidate in (run_dir / "evaluations").glob(f"{clean_prefix}*-attempt*"):
             if not (candidate / "COMPLETED").exists():
@@ -1595,10 +1696,20 @@ def validate_phase2_acceptance(output_root: str | Path = "outputs") -> dict[str,
             clean_frame = pd.read_parquet(clean[0][0])
             input_frame = records_by_name[files[0]]
             zero = input_frame[input_frame.radius.astype(float).eq(0.0)]
+            if (
+                not zero.empty
+                and "adversarial_prediction" in zero
+                and zero.clean_prediction.ne(zero.adversarial_prediction).any()
+            ):
+                errors.append(f"radius-zero attack changes predictions: {run_dir}")
             prediction_column = (
                 "reconstruction_prediction" if key[0] == "autoencoder" else "prediction"
             )
-            if prediction_column in clean_frame and not zero.empty:
+            # VIB clean and attack evaluations independently average finite
+            # posterior samples. Near-tied examples can differ even when both
+            # use the registered 32 draws, so validate the attack's internal
+            # epsilon-zero baseline rather than demanding cross-run identity.
+            if key[0] != "vib" and prediction_column in clean_frame and not zero.empty:
                 comparison = clean_frame[["sample_id", prediction_column]].merge(
                     zero[["sample_id", "clean_prediction"]],
                     on="sample_id",
@@ -1630,17 +1741,25 @@ def validate_phase2_acceptance(output_root: str | Path = "outputs") -> dict[str,
                 )
                 == ATTACK_PROTOCOL_VERSION
             ]
-        if len(diagnostics) != 1:
-            errors.append(f"expected one attack correctness diagnostic: {run_dir}")
-        elif (
-            json.loads((diagnostics[0] / "diagnostics.json").read_text()).get("status") != "passed"
-        ):
-            errors.append(f"failed attack correctness diagnostics: {run_dir}")
+        passed_diagnostics = [
+            candidate
+            for candidate in diagnostics
+            if json.loads((candidate / "diagnostics.json").read_text()).get("status") == "passed"
+            and not json.loads((candidate / "diagnostics.json").read_text()).get(
+                "independent_audit", False
+            )
+        ]
+        if policy["phase2_robustness"] and not passed_diagnostics:
+            if diagnostics:
+                errors.append(f"failed attack correctness diagnostics: {run_dir}")
+            else:
+                errors.append(f"expected one attack correctness diagnostic: {run_dir}")
     report = {
         "status": "ready" if not errors else "not_ready",
         "expected_runs": len(expected),
         "observed_runs": len(observed),
         "decision_records": [str(path) for path in decision_records],
+        "runtime_amendment": str(runtime_amendment) if runtime_amendment is not None else None,
         "errors": errors,
     }
     write_json(output_root / "phase2_acceptance.json", report)

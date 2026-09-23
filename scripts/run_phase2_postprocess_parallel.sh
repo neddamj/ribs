@@ -7,6 +7,7 @@ output_root="${OUTPUT_ROOT:-outputs}"
 python_bin="${PYTHON_BIN:-python}"
 gpu_count="${GPU_COUNT:-4}"
 run_tag="${PHASE2_RUN_TAG:-$(date -u +%Y%m%dT%H%M%SZ)}"
+runtime_amendment="${PHASE2_RUNTIME_AMENDMENT:-configs/phase2_runtime_amendment_20260917.yaml}"
 export PYTHONPATH="${PYTHONPATH:-}:src"
 
 if (( gpu_count < 1 )); then
@@ -101,6 +102,7 @@ launch_run() {
     env CUDA_VISIBLE_DEVICES="${gpu}" CUBLAS_WORKSPACE_CONFIG=:4096:8 \
       OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
       PYTHONUNBUFFERED=1 PYTHON_BIN="${python_bin}" OUTPUT_ROOT="${output_root}" \
+      PHASE2_RUNTIME_AMENDMENT="${runtime_amendment}" \
       PHASE2_FAMILIES="${family}" PHASE2_RUN_DIRS="${run_dir}" PHASE2_FINALIZE=false \
       PHASE2_RUN_TAG="${run_tag}_${key}" \
       PHASE2_AUDIT_PATH="${output_root}/phase2_duplicate_provenance_parallel_${run_tag}_${key}.json" \
@@ -127,11 +129,13 @@ done
 
 aggregate_failed=0
 "${python_bin}" -m ribs.cli aggregate --output-root "${output_root}" --experiment phase2 \
-  --include-families dimensional vib vq quantized autoencoder || aggregate_failed=1
+  --include-families dimensional vib vq quantized autoencoder \
+  --runtime-amendment "${runtime_amendment}" || aggregate_failed=1
 "${python_bin}" -m ribs.cli render --experiment phase2 \
   --summary "${output_root}/phase2_summary.parquet" \
   --output-dir "${output_root}/figures_phase2" || aggregate_failed=1
-"${python_bin}" -m ribs.cli validate-phase2 --output-root "${output_root}" || failed=$((failed + 1))
+"${python_bin}" -m ribs.cli validate-phase2 --output-root "${output_root}" \
+  --runtime-amendment "${runtime_amendment}" || failed=$((failed + 1))
 
 if (( failed > 0 || aggregate_failed > 0 )); then
   echo "Phase 2 postprocessing finished with worker_failures=${failed} aggregate_failure=${aggregate_failed}" >&2

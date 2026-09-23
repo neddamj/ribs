@@ -29,6 +29,7 @@ PHASE2_SPECS: dict[str, tuple[str, tuple[Any, ...]]] = {
     "autoencoder": ("dz", (512, 256, 128, 64, 32)),
 }
 PHASE2_SEEDS = (0, 1, 2)
+DEFAULT_RUNTIME_AMENDMENT = Path("configs/phase2_runtime_amendment_20260917.yaml")
 
 
 def parameter_for_family(family: str) -> str:
@@ -83,6 +84,90 @@ def expected_phase2_matrix(
         for value in values_for_family(family)
         for seed in seeds
     ]
+
+
+def load_runtime_amendment(path: str | Path = DEFAULT_RUNTIME_AMENDMENT) -> dict[str, Any]:
+    """Load and validate the dated, post-results runtime reduction."""
+    path = Path(path)
+    amendment = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(amendment, dict) or amendment.get("record_type") != "runtime_amendment":
+        raise ValueError(f"Invalid Phase 2 runtime amendment: {path}")
+    phase2 = amendment.get("phase2", {})
+    selected = phase2.get("primary_robustness_strengths", {})
+    if set(selected) != {"vib", "vq", "quantized", "autoencoder"}:
+        raise ValueError("Runtime amendment must define every new Phase 2 family")
+    for family, values in selected.items():
+        normalized = [normalize_strength(family, value) for value in values]
+        registered = [normalize_strength(family, value) for value in values_for_family(family)]
+        if any(value not in registered for value in normalized):
+            raise ValueError(f"Unregistered {family} strength in runtime amendment")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError(f"Duplicate {family} strength in runtime amendment")
+        if family == "autoencoder" and normalized:
+            raise ValueError("Autoencoder robustness must remain excluded by the amendment")
+        if family != "autoencoder" and len(normalized) != 4:
+            raise ValueError(f"Runtime amendment must retain exactly four {family} strengths")
+    if [int(seed) for seed in phase2.get("training_seeds", [])] != list(PHASE2_SEEDS):
+        raise ValueError("Reduced Phase 2 must retain all three training seeds")
+    masking = phase2.get("masking_checks", {})
+    if set(masking.get("families", [])) - {"vq", "quantized"}:
+        raise ValueError("Masking checks are only defined for VQ and quantized families")
+    if [int(seed) for seed in masking.get("seeds", [])] != [0]:
+        raise ValueError("Reduced masking checks must use the prespecified seed-0 sweep")
+    phase3 = amendment.get("phase3", {})
+    phase3_selected = phase3.get("adversarial_collision_strengths", {})
+    if set(phase3_selected) != {"dimensional", "vq", "quantized"}:
+        raise ValueError("Reduced Phase 3 must cover dimensional, VQ, and quantized families")
+    for family, values in phase3_selected.items():
+        normalized = [normalize_strength(family, value) for value in values]
+        registered = [normalize_strength(family, value) for value in values_for_family(family)]
+        if (
+            len(normalized) != 4
+            or len(normalized) != len(set(normalized))
+            or any(value not in registered for value in normalized)
+        ):
+            raise ValueError(f"Invalid reduced Phase 3 strengths for {family}")
+    if [int(seed) for seed in phase3.get("training_seeds", [])] != list(PHASE2_SEEDS):
+        raise ValueError("Reduced Phase 3 must retain all three training seeds")
+    if phase3.get("pair_selection") != "deterministic_source_round_robin":
+        raise ValueError("Reduced Phase 3 must use source-round-robin pair selection")
+    if not phase3.get("report_unique_sources_as_sampling_units", False):
+        raise ValueError("Reduced Phase 3 must report unique sources as sampling units")
+    return amendment
+
+
+def runtime_policy_for_config(config: dict[str, Any], amendment: dict[str, Any]) -> dict[str, bool]:
+    """Return which expensive post-training stages are required for one run."""
+    family = str(config.get("model", {}).get("family", "")).lower()
+    seed = int(config.get("seed", -1))
+    if family not in PHASE2_SPECS:
+        return {
+            "phase2_robustness": False,
+            "phase2_masking_checks": False,
+            "phase3_collision": False,
+        }
+    _, strength = strength_from_config(config)
+    phase2 = amendment["phase2"]
+    selected = {
+        normalize_strength(family, value)
+        for value in phase2.get("primary_robustness_strengths", {}).get(family, [])
+    }
+    masking = phase2.get("masking_checks", {})
+    phase3_values = {
+        normalize_strength(family, value)
+        for value in amendment.get("phase3", {})
+        .get("adversarial_collision_strengths", {})
+        .get(family, [])
+    }
+    return {
+        "phase2_robustness": strength in selected and seed in PHASE2_SEEDS,
+        "phase2_masking_checks": (
+            family in set(masking.get("families", []))
+            and seed in {int(value) for value in masking.get("seeds", [])}
+            and strength in selected
+        ),
+        "phase3_collision": strength in phase3_values and seed in PHASE2_SEEDS,
+    }
 
 
 def _comparable(config: dict[str, Any]) -> str:

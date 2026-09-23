@@ -91,6 +91,31 @@ def test_phase2_matrix_has_fixed_strengths():
     assert mixed.strength_value.tolist() == ["FP32", "8", "512"]
 
 
+def test_runtime_amendment_selects_balanced_reduced_matrix():
+    from ribs.phase2 import load_runtime_amendment, runtime_policy_for_config
+
+    amendment = load_runtime_amendment("configs/phase2_runtime_amendment_20260917.yaml")
+    selected = runtime_policy_for_config(
+        {"seed": 2, "model": {"family": "vq", "codebook_size": 128}}, amendment
+    )
+    omitted = runtime_policy_for_config(
+        {"seed": 2, "model": {"family": "vq", "codebook_size": 256}}, amendment
+    )
+    masking = runtime_policy_for_config(
+        {"seed": 0, "model": {"family": "quantized", "bits": 3}}, amendment
+    )
+    autoencoder = runtime_policy_for_config(
+        {"seed": 0, "model": {"family": "autoencoder", "dz": 512}}, amendment
+    )
+
+    assert selected["phase2_robustness"]
+    assert selected["phase3_collision"]
+    assert not omitted["phase2_robustness"]
+    assert masking["phase2_masking_checks"]
+    assert not autoencoder["phase2_robustness"]
+    assert not autoencoder["phase3_collision"]
+
+
 def test_frozen_decision_record_schema_is_valid():
     from ribs.phase2 import validate_decision_record
 

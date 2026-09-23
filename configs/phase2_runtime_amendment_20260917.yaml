@@ -1,0 +1,50 @@
+record_type: runtime_amendment
+date: 2026-09-17
+status: frozen_before_restarting_postprocessing
+supersedes_for_runtime_only: configs/phase2_decision_20260902T120000.yaml
+results_already_inspected: true
+rationale:
+  - Phase 2 training is complete for all 69 registered runs.
+  - The original postprocessing script unintentionally coupled the Phase 3 collision study to Phase 2.
+  - Completed Phase 2 runs show small robustness effects, so training seeds are retained while the replicated strength grid is reduced.
+  - Autoencoder reconstruction accuracy ranges from approximately 18 to 32 percent versus 89.7 percent on original images, making its robustness curves clean-accuracy-confounded.
+  - Completed discrete collision evaluations found no exact collision in 1000 evaluated pairs per configuration and used only approximately 128 to 131 unique sources.
+claim_boundary:
+  - Phase 2 robustness claims cover dimensional, VIB, VQ, and scalar-quantized bottlenecks, not reconstruction bottlenecks.
+  - Autoencoders remain a reconstruction and representation-geometry validation family.
+  - Results under this amendment are transparently labeled as an amended confirmatory analysis because Phase 2 results were inspected before the reduction.
+  - Phase 3 exact-collision results establish attack-found events only and are not evidence that collisions are impossible.
+  - For stochastic VIB models, the epsilon-zero correctness check is internal to each attack evaluation; independently averaged finite-sample clean predictions need not match per sample.
+phase2:
+  training_matrix_unchanged: true
+  clean_geometry_and_invariance_all_trained_runs: true
+  primary_robustness_strengths:
+    vib: [0.0, 0.0003, 0.003, 0.01]
+    vq: [512, 128, 32, 16]
+    quantized: [FP32, 6, 3, 2]
+    autoencoder: []
+  training_seeds: [0, 1, 2]
+  masking_checks:
+    families: [vq, quantized]
+    seeds: [0]
+    strengths: primary_robustness_strengths
+  collisions_in_phase2: false
+  attack_budget_unchanged:
+    steps: 40
+    restarts: 5
+    vib_eot_samples: 32
+    input_epsilons: [0.0, 0.00392156862745, 0.0078431372549, 0.0156862745098, 0.0313725490196, 0.0470588235294, 0.0627450980392]
+    latent_rhos: [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3]
+phase3:
+  retain_completed_larger_evaluations: true
+  natural_collision_analysis_all_trained_runs: true
+  adversarial_collision_strengths:
+    dimensional: [512, 128, 32, 16]
+    vq: [512, 128, 32, 16]
+    quantized: [FP32, 6, 3, 2]
+  training_seeds: [0, 1, 2]
+  pair_selection: deterministic_source_round_robin
+  tuning_pairs: 50
+  tuning_lambdas: [0.3, 1.0, 3.0]
+  final_pairs: 300
+  report_unique_sources_as_sampling_units: true
