@@ -25,6 +25,13 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def sample_ids_hash(sample_ids: list[str] | tuple[str, ...]) -> str:
+    """Hash an ordered audit sample manifest without changing the samples."""
+    digest = hashlib.sha256()
+    digest.update("\n".join(str(sample_id) for sample_id in sample_ids).encode("utf-8"))
+    return digest.hexdigest()
+
+
 def _find_split(root: Path, split: str) -> Path:
     candidates = [root / split, root / "imagenette2-320" / split]
     for candidate in candidates:

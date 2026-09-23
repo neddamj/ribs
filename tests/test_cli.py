@@ -69,6 +69,16 @@ def test_attack_diagnostics_accepts_independent_audit_overrides():
     assert args.diagnostic_tolerance == 0.02
 
 
+def test_attack_audit_amendment_is_preregistered_and_strict():
+    from ribs.phase2 import load_attack_audit_amendment
+
+    amendment = load_attack_audit_amendment("configs/phase2_attack_audit_amendment_20260921.yaml")
+    assert amendment["amendment_id"] == "phase2-attack-audit-v1-20260921"
+    assert amendment["protocol"]["sample_count"] == 128
+    assert amendment["protocol"]["tolerance"] == 0.02
+
+
+
 def test_phase2_matrix_has_fixed_strengths():
     import pandas as pd
 

@@ -22,11 +22,12 @@ from .collisions import (
     nearest_opposing,
 )
 from .config import config_hash
-from .data import manifest_hash, sha256_file
+from .data import manifest_hash, sample_ids_hash, sha256_file
 from .evaluation import (
     ATTACK_PROTOCOL_VERSION,
     _ReconstructionTask,
     _resolve_checkpoint,
+    _stratified_dataset_indices,
     extract_latents,
     load_model,
     make_loader,
@@ -1378,9 +1379,75 @@ def validate_phase1_acceptance(output_root: str | Path = "outputs") -> dict[str,
     return report
 
 
+def _valid_superseding_attack_audit(
+    run_dir: Path,
+    diagnostics_path: Path,
+    amendment_path: Path,
+    amendment: dict[str, Any],
+) -> tuple[bool, str]:
+    """Validate one amended audit's immutable provenance and sample manifest."""
+    try:
+        report = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        config_path = run_dir / "resolved_config.yaml"
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        protocol = amendment["protocol"]
+        required = {
+            "audit_amendment_id": amendment["amendment_id"],
+            "audit_amendment_sha256": sha256_file(amendment_path),
+            "attack_protocol_version": int(protocol["attack_protocol_version"]),
+            "diagnostic_samples": int(protocol["sample_count"]),
+            "tolerance": float(protocol["tolerance"]),
+            "baseline_steps": int(protocol["baseline"]["steps"]),
+            "baseline_restarts": int(protocol["baseline"]["restarts"]),
+            "stronger_steps": int(protocol["stronger"]["steps"]),
+            "stronger_restarts": int(protocol["stronger"]["restarts"]),
+            "sample_selection": protocol["sample_selection"],
+            "status": "passed",
+            "independent_audit": True,
+        }
+        for key, expected in required.items():
+            observed = report.get(key)
+            if isinstance(expected, float):
+                if observed is None or abs(float(observed) - expected) > 1e-12:
+                    return False, f"{key} mismatch"
+            elif observed != expected:
+                return False, f"{key} mismatch"
+        checkpoint = str(report.get("checkpoint", ""))
+        checkpoint_path = run_dir / "checkpoints" / checkpoint
+        if not checkpoint_path.is_file():
+            return False, "checkpoint is missing"
+        provenance = {
+            "resolved_config_sha256": sha256_file(config_path),
+            "data_manifest_sha256": sha256_file(Path(config["data"]["manifest"])),
+            "checkpoint_sha256": sha256_file(checkpoint_path),
+        }
+        for key, expected in provenance.items():
+            if report.get(key) != expected:
+                return False, f"{key} mismatch"
+        sample_ids = [str(value) for value in report.get("sample_ids", [])]
+        if len(sample_ids) != int(protocol["sample_count"]):
+            return False, "sample count mismatch"
+        if report.get("sample_manifest_hash") != sample_ids_hash(sample_ids):
+            return False, "sample manifest hash mismatch"
+        loader = make_loader(config, "final", batch_size=1)
+        indices = _stratified_dataset_indices(loader.dataset, len(sample_ids))
+        expected_ids = [str(loader.dataset.frame.iloc[index].sample_id) for index in indices]
+        if sample_ids != expected_ids:
+            return False, "sample manifest contents mismatch"
+        if str(config.get("model", {}).get("family", "")).lower() == "vib":
+            if report.get("baseline_eot_samples") != int(protocol["vib"]["baseline_eot_samples"]):
+                return False, "VIB baseline EoT mismatch"
+            if report.get("increased_eot_samples") != int(protocol["vib"]["stronger_eot_samples"]):
+                return False, "VIB stronger EoT mismatch"
+        return True, "valid"
+    except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+        return False, str(exc)
+
+
 def validate_phase2_acceptance(
     output_root: str | Path = "outputs",
     runtime_amendment: str | Path | None = None,
+    audit_amendment: str | Path | None = None,
 ) -> dict[str, Any]:
     """Validate the final artifact contract for the four new Phase 2 families."""
     output_root = Path(output_root)
@@ -1389,6 +1456,13 @@ def validate_phase2_acceptance(
         from .phase2 import load_runtime_amendment
 
         amendment = load_runtime_amendment(runtime_amendment)
+    audit_protocol = None
+    audit_amendment_path = None
+    if audit_amendment is not None:
+        from .phase2 import load_attack_audit_amendment
+
+        audit_amendment_path = Path(audit_amendment)
+        audit_protocol = load_attack_audit_amendment(audit_amendment_path)
     expected = {
         (family, value, seed)
         for family in ("vib", "vq", "quantized", "autoencoder")
@@ -1749,6 +1823,18 @@ def validate_phase2_acceptance(
                 "independent_audit", False
             )
         ]
+        if audit_protocol is not None and audit_amendment_path is not None:
+            for candidate in diagnostics:
+                diagnostic_report = json.loads((candidate / "diagnostics.json").read_text())
+                if diagnostic_report.get("audit_amendment_id") != audit_protocol["amendment_id"]:
+                    continue
+                valid, reason = _valid_superseding_attack_audit(
+                    run_dir, candidate / "diagnostics.json", audit_amendment_path, audit_protocol
+                )
+                if valid:
+                    passed_diagnostics.append(candidate)
+                else:
+                    errors.append(f"invalid superseding attack audit: {candidate}: {reason}")
         if policy["phase2_robustness"] and not passed_diagnostics:
             if diagnostics:
                 errors.append(f"failed attack correctness diagnostics: {run_dir}")
@@ -1760,6 +1846,7 @@ def validate_phase2_acceptance(
         "observed_runs": len(observed),
         "decision_records": [str(path) for path in decision_records],
         "runtime_amendment": str(runtime_amendment) if runtime_amendment is not None else None,
+        "audit_amendment": str(audit_amendment) if audit_amendment is not None else None,
         "errors": errors,
     }
     write_json(output_root / "phase2_acceptance.json", report)

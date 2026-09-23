@@ -30,6 +30,54 @@ PHASE2_SPECS: dict[str, tuple[str, tuple[Any, ...]]] = {
 }
 PHASE2_SEEDS = (0, 1, 2)
 DEFAULT_RUNTIME_AMENDMENT = Path("configs/phase2_runtime_amendment_20260917.yaml")
+DEFAULT_ATTACK_AUDIT_AMENDMENT = Path("configs/phase2_attack_audit_amendment_20260921.yaml")
+
+
+def load_attack_audit_amendment(
+    path: str | Path = DEFAULT_ATTACK_AUDIT_AMENDMENT,
+) -> dict[str, Any]:
+    """Load the explicit, pre-registered Phase 2 audit amendment."""
+    path = Path(path)
+    amendment = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(amendment, dict) or amendment.get("record_type") != (
+        "phase2_attack_audit_amendment"
+    ):
+        raise ValueError(f"Invalid Phase 2 attack-audit amendment: {path}")
+    protocol = amendment.get("protocol", {})
+    if amendment.get("status") != "preregistered_before_superseding_audits":
+        raise ValueError("Attack-audit amendment must be preregistered")
+    if int(protocol.get("attack_protocol_version", -1)) != 2:
+        raise ValueError("Attack-audit amendment must use protocol version 2")
+    if int(protocol.get("sample_count", -1)) != 128:
+        raise ValueError("Attack-audit amendment must use 128 samples")
+    if float(protocol.get("tolerance", -1)) != 0.02:
+        raise ValueError("Attack-audit amendment must retain tolerance 0.02")
+    baseline = protocol.get("baseline", {})
+    stronger = protocol.get("stronger", {})
+    if (int(baseline.get("steps", -1)), int(baseline.get("restarts", -1))) != (40, 5):
+        raise ValueError("Attack-audit baseline must use 40 steps and 5 restarts")
+    if (int(stronger.get("steps", -1)), int(stronger.get("restarts", -1))) != (80, 10):
+        raise ValueError("Attack-audit stronger run must use 80 steps and 10 restarts")
+    vib = protocol.get("vib", {})
+    if (int(vib.get("baseline_eot_samples", -1)), int(vib.get("stronger_eot_samples", -1))) != (
+        32,
+        64,
+    ):
+        raise ValueError("VIB attack-audit EoT must use 32 versus 64 samples")
+    required = set(protocol.get("required_config_fields", []))
+    if required != {
+        "resolved_config_sha256",
+        "data_manifest_sha256",
+        "checkpoint_sha256",
+        "sample_manifest_sha256",
+    }:
+        raise ValueError("Attack-audit amendment has incomplete provenance requirements")
+    acceptance = amendment.get("acceptance", {})
+    if acceptance.get("only_this_amendment_id") != amendment.get("amendment_id"):
+        raise ValueError("Attack-audit acceptance must be bound to this amendment ID")
+    if not acceptance.get("reject_unidentified_independent_audits", False):
+        raise ValueError("Unidentified independent audits must be rejected")
+    return amendment
 
 
 def parameter_for_family(family: str) -> str:

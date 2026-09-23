@@ -128,6 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
     diagnostics.add_argument("--checkpoint")
     diagnostics.add_argument("--diagnostic-samples", type=int)
     diagnostics.add_argument("--diagnostic-tolerance", type=float)
+    diagnostics.add_argument("--audit-amendment")
 
     collision = subparsers.add_parser("collision-attack")
     collision.add_argument("--run-dir", required=True)
@@ -169,6 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate2 = subparsers.add_parser("validate-phase2")
     validate2.add_argument("--output-root", default="outputs")
     validate2.add_argument("--runtime-amendment")
+    validate2.add_argument("--audit-amendment")
     run_manifest = subparsers.add_parser("phase2-run-dirs")
     run_manifest.add_argument("--output-root", default="outputs")
     run_manifest.add_argument("--families", nargs="+", required=True)
@@ -340,7 +342,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             from ..analysis import validate_phase2_acceptance
 
-            report = validate_phase2_acceptance(args.output_root, args.runtime_amendment)
+            report = validate_phase2_acceptance(
+                args.output_root, args.runtime_amendment, args.audit_amendment
+            )
             print(report)
             if report["status"] != "ready":
                 return 2
@@ -362,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.checkpoint,
                 args.diagnostic_samples,
                 args.diagnostic_tolerance,
+                args.audit_amendment,
             )
         else:
             path = evaluate_attack_diagnostics(
@@ -370,6 +375,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.checkpoint,
                 args.diagnostic_samples,
                 args.diagnostic_tolerance,
+                args.audit_amendment,
             )
         print(path)
         return 0

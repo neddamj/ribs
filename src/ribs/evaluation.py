@@ -18,8 +18,9 @@ from .artifacts import load_latents, save_frame, save_latents
 from .attacks import _seeded_rng, input_pgd, latent_pgd, prequantization_latent_pgd
 from .collisions import calibrate_collision_threshold, nearest_opposing, targeted_collision_attack
 from .config import config_hash
-from .data import ImagenetteDataset, manifest_hash, sha256_file
+from .data import ImagenetteDataset, manifest_hash, sample_ids_hash, sha256_file
 from .models import create_model
+from .phase2 import load_attack_audit_amendment
 from .square_attack import square_attack
 from .training import choose_device
 from .utils import environment_info, seed_everything, write_json
@@ -595,6 +596,7 @@ def evaluate_attack_diagnostics(
     checkpoint: str | None = None,
     diagnostic_samples: int | None = None,
     diagnostic_tolerance: float | None = None,
+    audit_amendment: str | Path | None = None,
 ) -> Path:
     """Run convergence checks for every attack surface on a shared subset.
 
@@ -603,6 +605,7 @@ def evaluate_attack_diagnostics(
     in the audit artifact for provenance.
     """
     run_dir = Path(run_dir)
+    amendment = load_attack_audit_amendment(audit_amendment) if audit_amendment else None
     checkpoint = _resolve_checkpoint(run_dir, checkpoint)
     model, config, device = load_model(run_dir, checkpoint)
     loader = make_loader(config, split, batch_size=1)
@@ -630,6 +633,17 @@ def evaluate_attack_diagnostics(
     )
     if tolerance < 0:
         raise ValueError("diagnostic_tolerance must be non-negative")
+    if amendment is not None:
+        protocol = amendment["protocol"]
+        if diagnostic_samples != int(protocol["sample_count"]):
+            raise ValueError("Superseding audit must use the amended sample count")
+        if abs(tolerance - float(protocol["tolerance"])) > 1e-12:
+            raise ValueError("Superseding audit must retain the amended tolerance")
+        if (steps, restarts) != (
+            int(protocol["baseline"]["steps"]),
+            int(protocol["baseline"]["restarts"]),
+        ):
+            raise ValueError("Superseding audit baseline does not match amendment")
     rows: list[dict[str, Any]] = []
     failures = []
 
@@ -770,6 +784,19 @@ def evaluate_attack_diagnostics(
         "independent_audit": diagnostic_samples is not None or diagnostic_tolerance is not None,
         "failures": failures,
     }
+    if amendment is not None:
+        manifest_path = Path(config["data"]["manifest"])
+        report.update(
+            {
+                "audit_amendment_id": amendment["amendment_id"],
+                "audit_amendment_sha256": sha256_file(Path(audit_amendment)),
+                "resolved_config_sha256": sha256_file(run_dir / "resolved_config.yaml"),
+                "data_manifest_sha256": sha256_file(manifest_path),
+                "checkpoint_sha256": sha256_file(run_dir / "checkpoints" / checkpoint),
+                "sample_manifest_hash": sample_ids_hash(report["sample_ids"]),
+                "sample_selection": amendment["protocol"]["sample_selection"],
+            }
+        )
     evaluation_dir = _new_evaluation_dir(run_dir, "attack-diagnostics", report)
     path = evaluation_dir / "diagnostics.json"
     write_json(path, report)
@@ -786,6 +813,7 @@ def evaluate_autoencoder_attack_diagnostics(
     checkpoint: str | None = None,
     diagnostic_samples: int | None = None,
     diagnostic_tolerance: float | None = None,
+    audit_amendment: str | Path | None = None,
 ) -> Path:
     """Run PGD correctness checks on the autoencoder task wrapper.
 
@@ -793,6 +821,7 @@ def evaluate_autoencoder_attack_diagnostics(
     not change the frozen primary attack settings.
     """
     run_dir = Path(run_dir)
+    amendment = load_attack_audit_amendment(audit_amendment) if audit_amendment else None
     autoencoder, config, device = load_model(run_dir, checkpoint)
     reference, reference_config, reference_device = load_model(reference_run_dir)
     if device != reference_device:
@@ -821,6 +850,12 @@ def evaluate_autoencoder_attack_diagnostics(
     )
     if tolerance < 0:
         raise ValueError("diagnostic_tolerance must be non-negative")
+    if amendment is not None:
+        protocol = amendment["protocol"]
+        if diagnostic_samples != int(protocol["sample_count"]):
+            raise ValueError("Superseding audit must use the amended sample count")
+        if abs(tolerance - float(protocol["tolerance"])) > 1e-12:
+            raise ValueError("Superseding audit must retain the amended tolerance")
     seed = int(attack_cfg.get("seed", 2025)) + 91_000_000
     failures = []
     rows = []
@@ -896,6 +931,20 @@ def evaluate_autoencoder_attack_diagnostics(
         "independent_audit": diagnostic_samples is not None or diagnostic_tolerance is not None,
         "failures": failures,
     }
+    if amendment is not None:
+        manifest_path = Path(config["data"]["manifest"])
+        checkpoint_name = checkpoint or _resolve_checkpoint(run_dir, None)
+        report.update(
+            {
+                "audit_amendment_id": amendment["amendment_id"],
+                "audit_amendment_sha256": sha256_file(Path(audit_amendment)),
+                "resolved_config_sha256": sha256_file(run_dir / "resolved_config.yaml"),
+                "data_manifest_sha256": sha256_file(manifest_path),
+                "checkpoint_sha256": sha256_file(run_dir / "checkpoints" / checkpoint_name),
+                "sample_manifest_hash": sample_ids_hash(report["sample_ids"]),
+                "sample_selection": amendment["protocol"]["sample_selection"],
+            }
+        )
     evaluation_dir = _new_evaluation_dir(run_dir, "autoencoder-attack-diagnostics", report)
     path = evaluation_dir / "diagnostics.json"
     write_json(path, report)

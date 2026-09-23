@@ -1,0 +1,65 @@
+record_type: phase2_attack_audit_amendment
+amendment_id: phase2-attack-audit-v1-20260921
+date_utc: '2026-09-21'
+status: preregistered_before_superseding_audits
+scope:
+  phase: 2
+  purpose: resolve_attack_correctness_diagnostics
+  affected_primary_diagnostics: 19
+  preserve_original_artifacts: true
+  preserve_original_failures: true
+  retrain_models: false
+reason:
+  primary_sample_count: 32
+  tolerance: 0.02
+  one_sample_fraction: 0.03125
+  statement: >-
+    The frozen 32-sample diagnostic has a resolution coarser than its two-percent
+    tolerance: one discrepancy is already 3.125 percent. A superseding,
+    explicitly identified 128-sample audit provides 0.78125 percent resolution
+    while retaining the registered tolerance and attack logic.
+protocol:
+  attack_protocol_version: 2
+  sample_count: 128
+  sample_selection: deterministic_stratified_dataset_order
+  tolerance: 0.02
+  baseline:
+    steps: 40
+    restarts: 5
+  stronger:
+    steps: 80
+    restarts: 10
+  vib:
+    baseline_eot_samples: 32
+    stronger_eot_samples: 64
+  required_config_fields:
+    - resolved_config_sha256
+    - data_manifest_sha256
+    - checkpoint_sha256
+    - sample_manifest_sha256
+  superseding_audit_marker: phase2_attack_audit_amendment
+  audit_id_field: amendment_id
+persistent_failure_followup:
+  final_attack:
+    steps: 80
+    restarts: 10
+    vib_eot_samples: 64
+  convergence_reference:
+    steps: 160
+    restarts: 20
+    vib_eot_samples: 128
+  preserve_superseded_final_evaluation: true
+acceptance:
+  only_this_amendment_id: phase2-attack-audit-v1-20260921
+  accepted_sample_count: 128
+  accepted_tolerance: 0.02
+  require_status: passed
+  reject_unidentified_independent_audits: true
+  reject_sample_manifest_mismatch: true
+  reject_config_or_checkpoint_mismatch: true
+notes: >-
+  This amendment changes only the attack-correctness audit protocol. It does
+  not raise tolerance, remove samples, alter seeds, or overwrite any prior
+  training, attack, or analysis artifact. Existing passing 128-sample audits
+  may be reused only after strict provenance validation; otherwise they are
+  treated as historical evidence and new audits are run.
