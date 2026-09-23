@@ -207,17 +207,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "train-matrix":
         base = _config(args)
         paths = []
+        from ..phase2 import completed_run_for_config
+
         for seed in args.seeds:
             for dz in args.dimensions:
                 config = copy.deepcopy(base)
                 config["seed"] = seed
                 config["model"] = {**config["model"], "family": "dimensional", "dz": dz}
-                paths.append(str(train_model(config)))
+                existing = completed_run_for_config(config.get("output_dir", "outputs"), config)
+                paths.append(str(existing) if existing is not None else str(train_model(config)))
         if not args.skip_identity:
             config = copy.deepcopy(base)
             config["seed"] = 0
             config["model"] = {**config["model"], "family": "identity", "dz": 512}
-            paths.append(str(train_model(config)))
+            existing = valid_identity_run(config.get("output_dir", "outputs"), 0, config)
+            paths.append(str(existing) if existing is not None else str(train_model(config)))
         print("\n".join(paths))
         return 0
     if args.command == "train-family-matrix":
