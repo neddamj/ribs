@@ -153,3 +153,34 @@ exit 0
     assert len(logs) == 2
     assert len({path.name for path in logs}) == 2
     assert not list((output_root / ".phase2_postprocess_claims").iterdir())
+
+
+def test_parallel_training_drains_final_partial_worker_batch(tmp_path):
+    output_root = tmp_path / "outputs"
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_python.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PYTHON_BIN": str(fake_python),
+        "OUTPUT_ROOT": str(output_root),
+        "GPU_COUNT": "4",
+        "PHASE2_RUN_TAG": "drain-test",
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/run_phase2_parallel.sh",
+            "configs",
+            "configs/phase2_decision_20260902T120000.yaml",
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr

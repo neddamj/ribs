@@ -31,9 +31,10 @@ declare -a gpu_for_pid=()
 running=0
 failed=0
 
-wait_for_slot() {
-  while (( running >= gpu_count )); do
-    progressed=0
+reap_finished() {
+  local wait_for_one="${1:-false}"
+  while true; do
+    local progressed=0
     for index in "${!pids[@]}"; do
       [[ -n "${pids[index]+present}" ]] || continue
       if ! kill -0 "${pids[index]}" 2>/dev/null; then
@@ -50,7 +51,14 @@ wait_for_slot() {
         progressed=1
       fi
     done
-    (( progressed )) || sleep 30
+    [[ "${wait_for_one}" == false || "${progressed}" -eq 1 ]] && return
+    sleep 5
+  done
+}
+
+wait_for_slot() {
+  while (( running >= gpu_count )); do
+    reap_finished true
   done
 }
 
@@ -113,8 +121,7 @@ for family_index in "${!families[@]}"; do
 done
 
 while (( running > 0 )); do
-  wait_for_slot
-  sleep 1
+  reap_finished true
 done
 
 if (( failed )); then
