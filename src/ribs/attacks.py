@@ -53,16 +53,29 @@ def _select(
     )
 
 
+_EOT_CHUNK_SIZE = 2
+
+
 def _eot_loss(model: torch.nn.Module, x: Tensor, y: Tensor, samples: int) -> tuple[Tensor, Tensor]:
     """Return expected CE and mean class probabilities for EoT prediction."""
-    losses = []
-    probabilities = None
-    for _ in range(max(1, samples)):
-        output = model(x, sample=samples > 1)
-        current = torch.softmax(output.logits.float(), dim=-1)
-        probabilities = current if probabilities is None else probabilities + current
-        losses.append(F.cross_entropy(output.logits.float(), y, reduction="none"))
-    return torch.stack(losses).mean(0), probabilities / max(1, samples)
+    count = max(1, samples)
+    loss_sum = torch.zeros(len(x), device=x.device)
+    probability_sum = None
+    for start in range(0, count, _EOT_CHUNK_SIZE):
+        chunk = min(_EOT_CHUNK_SIZE, count - start)
+        expanded = x.repeat_interleave(chunk, dim=0)
+        expanded_labels = y.repeat_interleave(chunk)
+        logits = model(expanded, sample=count > 1).logits.float()
+        current_loss = F.cross_entropy(logits, expanded_labels, reduction="none").view(
+            len(x), chunk
+        )
+        current_probability = torch.softmax(logits, dim=-1).view(len(x), chunk, -1)
+        loss_sum = loss_sum + current_loss.sum(dim=1)
+        chunk_probability = current_probability.sum(dim=1)
+        probability_sum = (
+            chunk_probability if probability_sum is None else probability_sum + chunk_probability
+        )
+    return loss_sum / count, probability_sum / count
 
 
 def _eot_loss_with_gradient(
@@ -75,19 +88,28 @@ def _eot_loss_with_gradient(
     single sample graph rather than with the number of EoT samples.
     """
     count = max(1, samples)
-    losses = []
-    probabilities = []
+    loss_sum = torch.zeros(len(x), device=x.device)
+    probability_sum = None
     gradient = torch.zeros_like(x)
-    for _ in range(count):
-        output = model(x, sample=count > 1)
-        logits = output.logits.float()
-        current_loss = F.cross_entropy(logits, y, reduction="none")
+    for start in range(0, count, _EOT_CHUNK_SIZE):
+        chunk = min(_EOT_CHUNK_SIZE, count - start)
+        expanded = x.repeat_interleave(chunk, dim=0)
+        expanded_labels = y.repeat_interleave(chunk)
+        logits = model(expanded, sample=count > 1).logits.float()
+        current_loss = F.cross_entropy(logits, expanded_labels, reduction="none").view(
+            len(x), chunk
+        )
         gradient = gradient + torch.autograd.grad(current_loss.sum(), x)[0]
-        losses.append(current_loss.detach())
-        probabilities.append(torch.softmax(logits.detach(), dim=-1))
+        loss_sum = loss_sum + current_loss.detach().sum(dim=1)
+        chunk_probability = (
+            torch.softmax(logits.detach(), dim=-1).view(len(x), chunk, -1).sum(dim=1)
+        )
+        probability_sum = (
+            chunk_probability if probability_sum is None else probability_sum + chunk_probability
+        )
     return (
-        torch.stack(losses).mean(0),
-        torch.stack(probabilities).mean(0),
+        loss_sum / count,
+        probability_sum / count,
         gradient / count,
     )
 
@@ -149,6 +171,18 @@ def input_pgd(
                     candidate_success,
                 )
                 best_restart = torch.where(replace, torch.full_like(best_restart, -2), best_restart)
+            # Nested robustness only needs one valid adversarial example. If
+            # every sample is already broken by the carried smaller-radius
+            # candidate, additional random starts cannot change the curve.
+            if bool(best_success.all()):
+                return AttackResult(
+                    best_x,
+                    best_loss,
+                    best_success,
+                    initial_loss.detach(),
+                    best_restart,
+                    retained_loss,
+                )
         attack_steps = max(1, steps)
         step_size = 2.0 * epsilon / attack_steps
         for restart in range(restarts):

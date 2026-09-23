@@ -44,12 +44,54 @@ def test_input_pgd_assesses_and_retains_the_final_update():
 
 
 def test_input_pgd_eot_uses_exact_sample_count_without_graph_accumulation():
-    model = ToyModel()
+    class CountingToyModel(ToyModel):
+        def __init__(self):
+            super().__init__()
+            self.batch_sizes = []
+
+        def forward(self, x, sample=False):
+            self.batch_sizes.append(len(x))
+            return super().forward(x, sample)
+
+    model = CountingToyModel()
     x = torch.full((2, 1, 2, 2), 0.75)
     y = torch.zeros(2, dtype=torch.long)
     result = input_pgd(model, x, y, 0.1, steps=1, restarts=1, eot_samples=4)
     assert torch.isfinite(result.loss).all()
     assert (result.adversarial - x).abs().max() <= 0.100001
+    assert model.batch_sizes == [4, 4, 4, 4, 4, 4]
+
+
+def test_input_pgd_skips_restarts_when_carried_candidate_breaks_entire_batch():
+    class CountingThresholdModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, x, sample=False):
+            self.calls += 1
+            score = x.flatten(1)[:, :1] - 0.5
+            logits = torch.cat([score, -score], dim=1)
+            return SimpleNamespace(logits=logits)
+
+    model = CountingThresholdModel()
+    x = torch.full((2, 1, 1, 1), 0.75)
+    y = torch.zeros(2, dtype=torch.long)
+    candidate = torch.full_like(x, 0.4)
+
+    result = input_pgd(
+        model,
+        x,
+        y,
+        epsilon=0.4,
+        steps=40,
+        restarts=5,
+        initial_adversarial=candidate,
+    )
+
+    assert result.successful.all()
+    assert result.restart.tolist() == [-2, -2]
+    assert model.calls == 2
 
 
 def test_input_pgd_can_carry_a_smaller_radius_candidate_forward():
