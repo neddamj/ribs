@@ -11,6 +11,7 @@ from ribs import evaluation
 from ribs.analysis import geometry_correlations
 from ribs.evaluation import (
     _cache_collision_images,
+    _candidate_collision_pairs,
     _collision_batch_sizes,
     _eligibility_records,
     _ReconstructionTask,
@@ -147,6 +148,13 @@ def test_collision_lambda_selection_is_deterministic_and_prespecified():
     assert selection["selected_lambda_sem"] == 1.0
 
 
+def test_collision_pair_limits_must_be_positive(tmp_path):
+    with pytest.raises(ValueError, match="max_pairs must be positive"):
+        evaluation.evaluate_collision_attacks(tmp_path, tmp_path, max_pairs=0)
+    with pytest.raises(ValueError, match="max_pairs must be positive"):
+        evaluation.tune_collision_lambda(tmp_path, tmp_path, [1.0], max_pairs=0)
+
+
 def test_collision_eligibility_is_independent_of_attack_batch_size():
     assert _collision_batch_sizes({"evaluation_batch_size": 32, "collision_batch_size": 8}) == (
         8,
@@ -154,6 +162,9 @@ def test_collision_eligibility_is_independent_of_attack_batch_size():
     )
     assert _collision_batch_sizes(
         {"evaluation_batch_size": 32, "collision_batch_size": 8}, "autoencoder"
+    ) == (2, 32)
+    assert _collision_batch_sizes(
+        {"evaluation_batch_size": 32, "collision_batch_size": 1}, "autoencoder"
     ) == (1, 32)
     with pytest.raises(ValueError, match="must be positive"):
         _collision_batch_sizes({"evaluation_batch_size": 0, "collision_batch_size": 8})
@@ -172,6 +183,17 @@ def test_collision_image_cache_decodes_each_selected_index_once():
     cache = _cache_collision_images(dataset, [(2, 4), (2, 7), (4, 7)])
     assert dataset.calls == [2, 4, 7]
     assert sorted(cache) == [2, 4, 7]
+
+
+def test_collision_pair_cap_prioritizes_unique_sources():
+    sample_ids = [f"sample-{index}" for index in range(12)]
+    labels = torch.tensor([index % 3 for index in range(12)])
+
+    pairs = _candidate_collision_pairs(sample_ids, labels)
+    first_pass = pairs[: len(sample_ids)]
+
+    assert len({source for source, _ in first_pass}) == len(sample_ids)
+    assert all(labels[source] != labels[target] for source, target in first_pass)
 
 
 def test_collision_eligibility_is_batch_partition_independent():
@@ -212,6 +234,13 @@ def test_resumable_evaluation_reuses_only_matching_attempt(tmp_path):
     )
     assert resumed == evaluation_dir
     assert complete
+
+    changed_batch_config = {**config, "collision_attack_batch_size": 2}
+    changed_batch_dir, complete = _resumable_evaluation_dir(
+        run_dir, "collision", changed_batch_config, "collision_attacks.parquet"
+    )
+    assert changed_batch_dir != evaluation_dir
+    assert not complete
 
 
 def test_collision_evaluation_resumes_completed_shards(tmp_path, monkeypatch):

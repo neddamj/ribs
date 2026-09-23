@@ -82,6 +82,8 @@ def test_phase2_shell_scripts_parse():
     scripts = [
         PROJECT_ROOT / "scripts" / "run_phase2_postprocess.sh",
         PROJECT_ROOT / "scripts" / "run_phase2_postprocess_parallel.sh",
+        PROJECT_ROOT / "scripts" / "run_phase3_collisions.sh",
+        PROJECT_ROOT / "scripts" / "run_phase3_collisions_parallel.sh",
     ]
     result = subprocess.run(
         ["bash", "-n", *(str(path) for path in scripts)],

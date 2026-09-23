@@ -1290,16 +1290,23 @@ def _eligibility_records(
 def _candidate_collision_pairs(
     sample_ids: list[str], labels: torch.Tensor
 ) -> list[tuple[int, int]]:
+    """Return deterministic pairs with broad source coverage first.
+
+    Each pass assigns one opposing class to every source before assigning a
+    second target to any source. This makes a capped experiment use many
+    independent sources instead of nine correlated pairs for each early source.
+    """
     classes = sorted(int(value) for value in torch.unique(labels))
+    class_position = {label: index for index, label in enumerate(classes)}
     source_order = sorted(
         range(len(sample_ids)),
         key=lambda index: hashlib.sha256(sample_ids[index].encode()).digest(),
     )
     pairs = []
-    for source_index in source_order:
-        for target_class in classes:
-            if target_class == int(labels[source_index]):
-                continue
+    for class_offset in range(1, len(classes)):
+        for source_index in source_order:
+            source_class = int(labels[source_index])
+            target_class = classes[(class_position[source_class] + class_offset) % len(classes)]
             candidates = torch.where(labels == target_class)[0].tolist()
             target_index = min(
                 candidates,
@@ -1320,9 +1327,11 @@ def _collision_batch_sizes(
     if collision_batch_size < 1 or evaluation_batch_size < 1:
         raise ValueError("collision_batch_size and evaluation_batch_size must be positive")
     # The reconstruction graph for an autoencoder is much larger than the
-    # classifier-only graph used by the other collision families.  Processing
-    # one pair at a time preserves pair selection, attack budgets, and seeds.
-    effective_attack_batch_size = 1 if family == "autoencoder" else collision_batch_size
+    # classifier-only graph used by the other collision families.  Cap its
+    # attack batch at two pairs while retaining any stricter configured limit.
+    effective_attack_batch_size = (
+        min(2, collision_batch_size) if family == "autoencoder" else collision_batch_size
+    )
     # Eligibility runs under no_grad and does not retain the reconstruction graph,
     # so it can use the ordinary evaluation batch independently of attack memory.
     return effective_attack_batch_size, evaluation_batch_size
@@ -1384,6 +1393,8 @@ def tune_collision_lambda(
     max_pairs: int = 200,
 ) -> Path:
     """Tune the semantic-loss weight on development_tune and freeze the result."""
+    if max_pairs <= 0:
+        raise ValueError("max_pairs must be positive")
     run_dir = Path(run_dir)
     reference_run_dir = Path(reference_run_dir)
     candidates = sorted({float(value) for value in lambdas})
@@ -1401,6 +1412,7 @@ def tune_collision_lambda(
         "split": "development_tune",
         "lambda_candidates": candidates,
         "max_pairs": int(max_pairs),
+        "pair_selection": "deterministic_source_round_robin_v2",
         "checkpoint": checkpoint,
         "checkpoint_sha256": sha256_file(run_dir / "checkpoints" / checkpoint),
         "reference_run": str(reference_run_dir),
@@ -1461,6 +1473,8 @@ def evaluate_collision_attacks(
     lambda_sem: float | None = None,
     tuning_artifact: str | Path | None = None,
 ) -> Path:
+    if max_pairs <= 0:
+        raise ValueError("max_pairs must be positive")
     run_dir = Path(run_dir)
     reference_run_dir = Path(reference_run_dir)
     checkpoint = _resolve_checkpoint(run_dir, None)
@@ -1518,10 +1532,13 @@ def evaluate_collision_attacks(
         lambda_sem = float(selection["selected_lambda_sem"])
     elif lambda_sem is None:
         raise ValueError("Non-final collision evaluation requires an explicit lambda_sem")
+    family = config["model"].get("family")
+    collision_batch_size, eligibility_batch_size = _collision_batch_sizes(config["attack"], family)
     evaluation_config = {
         "kind": "collision",
         "split": split,
         "max_pairs": max_pairs,
+        "pair_selection": "deterministic_source_round_robin_v2",
         "lambda_sem": lambda_sem,
         "collision_batch_size": int(config["attack"].get("collision_batch_size", 8)),
         "attack": config["attack"],
@@ -1536,18 +1553,21 @@ def evaluate_collision_attacks(
         "tuning_artifact_sha256": (sha256_file(tuning_path) if tuning_path is not None else None),
         "attack_protocol_version": ATTACK_PROTOCOL_VERSION,
     }
+    # Autoencoder shard boundaries and attack seeds depend on this effective
+    # batch. Include it in the resumable identity so batch-1 shards are never
+    # mixed with batch-2 shards after a restart.
+    if family == "autoencoder":
+        evaluation_config["collision_attack_batch_size"] = collision_batch_size
+        evaluation_config["collision_eligibility_batch_size"] = eligibility_batch_size
     evaluation_dir, evaluation_complete = _resumable_evaluation_dir(
         run_dir, "collision", evaluation_config, "collision_attacks.parquet"
     )
     if evaluation_complete:
         return evaluation_dir / "collision_attacks.parquet"
-    if config["model"].get("family") == "autoencoder":
+    if family == "autoencoder":
         model = _ReconstructionTask(model, reference).to(device).eval().requires_grad_(False)
     model.eval()
     reference.eval()
-    collision_batch_size, eligibility_batch_size = _collision_batch_sizes(
-        config["attack"], config["model"].get("family")
-    )
     evaluation_config["collision_attack_batch_size"] = collision_batch_size
     evaluation_config["collision_eligibility_batch_size"] = eligibility_batch_size
     eligibility_loader = make_loader(config, split, batch_size=eligibility_batch_size)
@@ -1769,9 +1789,7 @@ def evaluate_square_attack(
     for batch_start in range(0, len(selected_indices), evaluation_batch_size):
         indices = selected_indices[batch_start : batch_start + evaluation_batch_size]
         samples = [dataset[index] for index in indices]
-        images = torch.stack([sample["image"] for sample in samples]).to(
-            device, non_blocking=True
-        )
+        images = torch.stack([sample["image"] for sample in samples]).to(device, non_blocking=True)
         labels = torch.tensor([sample["label"] for sample in samples], device=device)
         sample_ids = [str(sample["sample_id"]) for sample in samples]
         with torch.no_grad():
@@ -1813,9 +1831,7 @@ def evaluate_square_attack(
                         "clean_prediction": int(clean_prediction_cpu[index]),
                         "clean_correct": bool(clean_prediction_cpu[index] == labels_cpu[index]),
                         "adversarial_prediction": int(adversarial_prediction_cpu[index]),
-                        "successful": bool(
-                            adversarial_prediction_cpu[index] != labels_cpu[index]
-                        ),
+                        "successful": bool(adversarial_prediction_cpu[index] != labels_cpu[index]),
                         "loss": float(result_loss_cpu[index]),
                         "retained_loss": float(result_retained_cpu[index]),
                         "initial_loss": float(result_initial_cpu[index]),

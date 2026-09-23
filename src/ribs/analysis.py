@@ -921,11 +921,40 @@ def aggregate_completed_runs(
         ):
             for keys, group in scoped.groupby(group_columns, dropna=False):
                 key_values = keys if isinstance(keys, tuple) else (keys,)
+                source_success = group.assign(
+                    _collision_success=group.collision_success.astype(bool).astype(float)
+                ).groupby("source_sample_id")["_collision_success"]
+                source_rates = source_success.mean().to_numpy(dtype=float)
+                source_any = source_success.max().to_numpy(dtype=float)
+                rng = np.random.default_rng(0)
+                if len(source_rates) == 1:
+                    bootstrap_rates = source_rates.copy()
+                else:
+                    bootstrap_rates = np.asarray(
+                        [
+                            source_rates[
+                                rng.integers(0, len(source_rates), size=len(source_rates))
+                            ].mean()
+                            for _ in range(2000)
+                        ]
+                    )
                 summary = {
                     **dict(zip(group_columns, key_values)),
                     "scope": scope,
                     "num_pairs": group[pair_columns].drop_duplicates().shape[0],
-                    "collision_success_rate": float(group.collision_success.astype(bool).mean()),
+                    "num_sources": len(source_rates),
+                    # Sources, not source-target pairs, are the amended Phase 3
+                    # sampling units. Each source contributes its mean success
+                    # rate once, even for retained legacy evaluations that used
+                    # several targets per source.
+                    "collision_success_rate": float(source_rates.mean()),
+                    "collision_success_rate_pair_weighted": float(
+                        group.collision_success.astype(bool).mean()
+                    ),
+                    "source_any_collision_rate": float(source_any.mean()),
+                    "source_bootstrap_estimate": float(bootstrap_rates.mean()),
+                    "source_ci95_lower": float(np.quantile(bootstrap_rates, 0.025)),
+                    "source_ci95_upper": float(np.quantile(bootstrap_rates, 0.975)),
                     "median_distance": float(group.distance.median()),
                     "median_distance_percentile": float(group.distance_percentile.median()),
                 }

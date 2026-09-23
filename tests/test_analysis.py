@@ -107,6 +107,59 @@ def test_analysis_attempts_are_immutable_and_truncated_attempts_are_not_final(tm
     assert partial != full
 
 
+def test_collision_summary_weights_unique_sources_equally(tmp_path):
+    run_dir = tmp_path / "dimensional" / "run"
+    evaluation_dir = run_dir / "evaluations" / "robustness-fixture-attempt0"
+    collision_dir = run_dir / "evaluations" / "collision-fixture-attempt0"
+    evaluation_dir.mkdir(parents=True)
+    collision_dir.mkdir(parents=True)
+    config = {
+        "seed": 0,
+        "model": {"family": "dimensional", "dz": 512},
+        "attack": {"input_epsilons": [0.0, 1.0], "latent_rhos": [1.0]},
+    }
+    (run_dir / "resolved_config.yaml").write_text(yaml.safe_dump(config))
+    (run_dir / "COMPLETED").write_text("completed\n")
+    (run_dir / "metrics.json").write_text(json.dumps({"codebook_collapsed": False}))
+    (evaluation_dir / "config.json").write_text(
+        json.dumps({"split": "final", "max_samples": None, "attack_protocol_version": 2})
+    )
+    (evaluation_dir / "COMPLETED").write_text("completed\n")
+    robustness = pd.DataFrame(
+        {
+            "sample_id": ["a", "a", "b", "b"],
+            "radius": [0.0, 1.0, 0.0, 1.0],
+            "clean_correct": [True, True, True, True],
+            "successful": [False, True, False, False],
+        }
+    )
+    robustness.to_parquet(evaluation_dir / "input_pgd.parquet", index=False)
+    robustness.to_parquet(evaluation_dir / "latent_pgd.parquet", index=False)
+    (collision_dir / "config.json").write_text(
+        json.dumps({"split": "final", "max_pairs": 4, "attack_protocol_version": 2})
+    )
+    (collision_dir / "COMPLETED").write_text("completed\n")
+    pd.DataFrame(
+        {
+            "source_sample_id": ["source-a"] * 3 + ["source-b"],
+            "target_sample_id": ["t1", "t2", "t3", "t4"],
+            "epsilon": [1.0] * 4,
+            "collision_success": [False, False, False, True],
+            "distance": [2.0, 2.0, 2.0, 1.0],
+            "distance_percentile": [0.8, 0.8, 0.8, 0.1],
+        }
+    ).to_parquet(collision_dir / "collision_attacks.parquet", index=False)
+
+    aggregate_completed_runs(tmp_path)
+
+    summary = pd.read_parquet(tmp_path / "phase1_collision_attack_summary.parquet")
+    full = summary[summary.scope == "full_eligible"].iloc[0]
+    assert full.num_sources == 2
+    assert full.collision_success_rate == 0.5
+    assert full.collision_success_rate_pair_weighted == 0.25
+    assert full.source_any_collision_rate == 0.5
+
+
 def test_phase2_amendment_keeps_omitted_runs_in_representation_summary(tmp_path):
     run_dir = tmp_path / "vib" / "run"
     run_dir.mkdir(parents=True)
